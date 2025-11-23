@@ -44,40 +44,8 @@ This log contains all the scripts and assets needed to create audio‑reactive a
 - Audio analysis driving the animation (intensity, beat, etc.)
 - Simple pipelines to render sequences or real‑time previews
 
-A showcase video for this log is currently in editing and will be linked here once it is published.
-
----
-
-## Getting Started
-
-> The exact setup may depend on your environment; the steps below are indicative.
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/DrDLP/olaf.git
-   cd olaf
-   ```
-
-2. **Navigate to the log you want to explore**
-   ```bash
-   cd "standalones/Log 1 (3d visualizers)"
-   # or
-   cd "standalones/Log 3 (puppies)"
-   ```
-
-3. **Install dependencies**  
-   Check the log‑specific documentation or script headers for required Python packages and tools  
-   (e.g. `pip install -r requirements.txt` if provided).
-
-4. **Run a demo script**  
-   Typical pattern (example, actual script names may differ):
-   ```bash
-   python main.py
-   ```
-   or
-   ```bash
-   python render_sequence.py --audio path/to/audio.wav --output out/
-   ```
+You can watch a demo of Log 1 here:  
+👉 https://youtu.be/adwtR8TwF6s
 
 ---
 
