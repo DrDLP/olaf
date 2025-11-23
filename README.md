@@ -44,7 +44,7 @@ This log contains all the scripts and assets needed to create audio‑reactive a
 - Audio analysis driving the animation (intensity, beat, etc.)
 - Simple pipelines to render sequences or real‑time previews
 
-You can watch a demo of Log 1 here:  
+You can watch a demo of Log 3 here:  
 👉 https://youtu.be/adwtR8TwF6s
 
 ---
