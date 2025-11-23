@@ -30,16 +30,8 @@ The goal is to explore spatial, abstract scenes that respond in real‑time or i
 You can watch a demo of Log 1 here:  
 👉 https://youtu.be/5c6w_tLqjCs
 
-> ℹ️ Note: GitHub Markdown does **not** support embedding a YouTube player directly with `<iframe>`.  
-> The usual pattern is to link the video (as above) or to use a thumbnail image that links to YouTube.
 
-Example thumbnail pattern (optional, if you add an image to the repo):
 
-```markdown
-[![Olaf Log 1 Demo](path/to/thumbnail.png)](https://youtu.be/5c6w_tLqjCs)
-```
-
----
 
 ## Log 3 – Puppies (Sprite‑Based Audio‑Reactive Animations)
 
