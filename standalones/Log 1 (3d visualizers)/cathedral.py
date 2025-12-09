@@ -79,8 +79,8 @@ HOP_LENGTH = 512         # hop size between spectrogram frames
 
 # ---- City / cathedral layout -------------------------------------------------
 
-GRID_X = 96              # number of columns along X (street direction)
-GRID_Z = 96              # number of columns along Z (depth)
+GRID_X = 16              # number of columns along X (street direction)
+GRID_Z = 16              # number of columns along Z (depth)
 BUILDING_SPACING = 1.3   # world-space distance between building centers
 
 # Radial weight for building heights (center vs. edge)

@@ -1,0 +1,36 @@
+# --- Python / build ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+*.log
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / OS crap
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# --- Olaf specific: user data, exports, temp ---
+# Projects: audio, stems, alignments, etc. 
+projects/
+
+
+# Demucs temp
+fonts/
+
+# Exported videos / frames (si tu en génères dans le repo)
+exports/
+frames/
+*.mp4
+*.mov
+*.avi
+*.mkv
