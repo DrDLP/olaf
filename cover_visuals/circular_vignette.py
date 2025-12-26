@@ -33,7 +33,7 @@ class CoverCircularVignetteEffect(BaseCoverEffect):
         "Audio-reactive circular spotlight on the cover, with adjustable "
         "center, radius range, brightness, feather and amplitude curve."
     )
-    effect_author: str = "Olaf"
+    effect_author: str = "DrDLP"
     effect_version: str = "1.3.0"
     effect_max_inputs: int = 1
 
@@ -87,7 +87,7 @@ class CoverCircularVignetteEffect(BaseCoverEffect):
                 label="Min radius (fraction of min side)",
                 type="float",
                 default=0.01,
-                minimum=0.01,
+                minimum=0.00,
                 maximum=0.50,  # max 0.5 pour garder un effet visible
                 step=0.01,
                 description=(

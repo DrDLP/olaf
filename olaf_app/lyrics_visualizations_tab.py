@@ -241,6 +241,8 @@ class LyricsVisualizationsTab(QWidget):
             initial_params = dict(params_global)
 
         # Instantiate plugin if we have a valid id
+        # Fill missing shared style keys from QSettings (defaults) + migrate legacy values
+        self._apply_global_text_style_defaults(initial_params)
         self._create_plugin_instance(pid, initial_config=initial_params)
 
         # Restore audio routing, preferring per-plugin routing if available
@@ -293,6 +295,7 @@ class LyricsVisualizationsTab(QWidget):
             amp = float(env.rms[idx])
 
         ctx = self._build_context_for_time(t, amp)
+        self._apply_runtime_font_scaling()
         self._current_plugin.update_frame(ctx)
 
     def on_duration_changed(self, duration_ms: int) -> None:
@@ -596,23 +599,20 @@ class LyricsVisualizationsTab(QWidget):
 
     def _build_context_for_time(self, t: float, amp: float) -> LyricsFrameContext:
         """
-        Map a playback time (seconds) to the current phrase + word, using the
+        Map a playback time (seconds) to the current phrase + word using the
         alignment data loaded from disk (phrases.json + words.json).
 
-        This function is the *only* place that decides:
-          - which phrase is active,
-          - which word is active,
-          - and where that word lies inside the phrase (character offsets),
-          - and now also provides the phrase duration.
+        Key requirements:
+          - repeated words on a line must highlight the correct occurrence ("the ... the")
+          - edits may reorder the internal list; do NOT rely on raw list order
+          - some words may have no word_index (e.g. inserted manually): fallback to time order
         """
         phrase_index: Optional[int] = None
         phrase_obj: Optional[Dict[str, Any]] = None
         phrase_start = 0.0
         phrase_end = 0.0
 
-        # --------------------------------------------------------------
-        # 1) Trouver la phrase active au temps t
-        # --------------------------------------------------------------
+        # 1) Find active phrase
         for idx, phrase in enumerate(self._phrases or []):
             try:
                 start = float(phrase.get("start", 0.0))
@@ -628,7 +628,6 @@ class LyricsVisualizationsTab(QWidget):
                 break
 
         if phrase_obj is None:
-            # En dehors de toute phrase -> contexte "vide"
             return LyricsFrameContext(
                 t=t,
                 amp=amp,
@@ -646,63 +645,111 @@ class LyricsVisualizationsTab(QWidget):
         local_phrase_time = max(0.0, t - phrase_start)
         phrase_duration = max(0.0, phrase_end - phrase_start)
 
-        # --------------------------------------------------------------
-        # 2) Déterminer le line_index utilisé pour les mots
-        # --------------------------------------------------------------
+        # 2) Collect words for this line
         line_index = phrase_obj.get("line_index", phrase_index)
 
-        # Tous les mots de cette ligne (ordre temporel)
-        line_words: list[tuple[int, Dict[str, Any]]] = []
+        raw_line_words: list[tuple[int, Dict[str, Any]]] = []
         for gidx, w in enumerate(self._words or []):
             if w.get("line_index", line_index) != line_index:
                 continue
-            line_words.append((gidx, w))
+            raw_line_words.append((gidx, w))
 
-        # --------------------------------------------------------------
-        # 3) Trouver le mot actif dans cette ligne (par timing)
-        # --------------------------------------------------------------
+        def _safe_f(x: Any, default: float = 0.0) -> float:
+            try:
+                return float(x)
+            except Exception:
+                return float(default)
+
+        def _safe_i(x: Any, default: int = -1) -> int:
+            try:
+                return int(x)
+            except Exception:
+                return int(default)
+
+        # Build a stable time order for this line (also used as fallback "text order").
+        by_time = sorted(
+            raw_line_words,
+            key=lambda it: (
+                _safe_f(it[1].get("start", 0.0), 0.0),
+                _safe_f(it[1].get("end", it[1].get("start", 0.0)), 0.0),
+                it[0],
+            ),
+        )
+        time_rank: dict[int, int] = {gidx: i for i, (gidx, _) in enumerate(by_time)}
+
+        # Text order: prefer word_index when present; fallback to time order if missing.
+        by_text = sorted(
+            raw_line_words,
+            key=lambda it: (
+                (_safe_i(it[1].get("word_index", -1), -1) if _safe_i(it[1].get("word_index", -1), -1) >= 0 else time_rank.get(it[0], 10**9)),
+                time_rank.get(it[0], 10**9),
+                it[0],
+            ),
+        )
+
+        # 3) Find active word by timing (robust to overlaps)
         current_word_text: Optional[str] = None
         current_word_global_idx: Optional[int] = None
 
-        for gidx, w in line_words:
-            try:
-                ws = float(w.get("start", 0.0))
-                we = float(w.get("end", ws))
-            except Exception:
-                continue
+        candidates: list[tuple[float, float, int, Dict[str, Any]]] = []
+        for gidx, w in by_time:
+            ws = _safe_f(w.get("start", 0.0), 0.0)
+            we = _safe_f(w.get("end", ws), ws)
             if ws <= t <= we:
-                current_word_text = str(w.get("text", ""))
-                current_word_global_idx = gidx
-                break
+                candidates.append((ws, we, gidx, w))
 
-        # --------------------------------------------------------------
-        # 4) Calculer la bonne occurrence du mot dans la phrase
-        #    (pour gérer "the . the" correctement)
-        # --------------------------------------------------------------
+        if candidates:
+            # Prefer the word that started most recently; then shortest end.
+            ws, we, gidx, w = sorted(candidates, key=lambda it: (-it[0], it[1], it[2]))[0]
+            _ = (ws, we)
+            current_word_text = str(w.get("text", ""))
+            current_word_global_idx = int(gidx)
+
+        # 4) Map active word -> character offsets in the phrase (token-aware + repeated words)
         word_char_start: Optional[int] = None
         word_char_end: Optional[int] = None
+
+        def _is_word_char(ch: str) -> bool:
+            return ch.isalnum() or ch in ("_", "-", "'", "’")
+
+        def _find_nth_exact_token(haystack: str, needle: str, n: int) -> int:
+            """Return the start index of the n-th exact token occurrence, or -1."""
+            if not needle:
+                return -1
+
+            count = 0
+            i = 0
+            L = len(needle)
+
+            while True:
+                j = haystack.find(needle, i)
+                if j < 0:
+                    return -1
+
+                left_ok = (j == 0) or (not _is_word_char(haystack[j - 1]))
+                right_i = j + L
+                right_ok = (right_i >= len(haystack)) or (not _is_word_char(haystack[right_i]))
+
+                if left_ok and right_ok:
+                    if count == n:
+                        return j
+                    count += 1
+
+                i = j + L
 
         if current_word_text and current_word_global_idx is not None:
             lower_line = text_full_line.lower()
             lower_word = current_word_text.lower()
 
-            # Déterminer la n-ième occurrence (0, 1, 2, ...) en fonction
-            # de l'indice global du mot sur cette ligne
+            # Count how many identical tokens appear before this one, in TEXT order.
             occurrence_index = 0
-            for gidx, w in line_words:
+            for gidx, w in by_text:
                 if gidx == current_word_global_idx:
                     break
                 if str(w.get("text", "")).lower() == lower_word:
                     occurrence_index += 1
 
-            pos = -1
-            start_search = 0
-            for _ in range(occurrence_index + 1):
-                pos = lower_line.find(lower_word, start_search)
-                if pos < 0:
-                    break
-                start_search = pos + len(lower_word)
-
+            pos = _find_nth_exact_token(lower_line, lower_word, occurrence_index)
             if pos >= 0:
                 word_char_start = pos
                 word_char_end = pos + len(lower_word)
@@ -719,7 +766,6 @@ class LyricsVisualizationsTab(QWidget):
             word_char_start=word_char_start,
             word_char_end=word_char_end,
         )
-
 
     # ------------------------------------------------------------------
     # Plugin combo / instance management
@@ -786,26 +832,17 @@ class LyricsVisualizationsTab(QWidget):
             self._current_plugin_id = None
             return
 
+        # Apply global style defaults (QSettings) and migrate legacy font sizing
+        cfg0 = getattr(instance, "config", None)
+        if isinstance(cfg0, dict):
+            self._apply_global_text_style_defaults(cfg0)
+
         # Simplified background behaviour: always use the project cover
         # (if the plugin exposes a "background_mode" parameter, it is
         # forced to "cover" so that gradient / solid modes are disabled).
         cfg = getattr(instance, "config", None)
         if isinstance(cfg, dict) and "background_mode" in cfg:
             cfg["background_mode"] = "cover"
-
-        # --------------------------------------------------------------
-        # IMPORTANT: Inject project cover pixmap into plugin instance.
-        # Plugins check this attribute when background_mode == 'cover'.
-        # --------------------------------------------------------------
-        if self._cover_pixmap is not None:
-            instance.cover_pixmap = self._cover_pixmap
-
-        # Add plugin widget into preview container
-        self.preview_layout.addWidget(instance)
-        instance.show()
-
-        self._current_plugin = instance
-        self._current_plugin_id = plugin_id
 
 
         # --------------------------------------------------------------
@@ -1448,25 +1485,44 @@ class LyricsVisualizationsTab(QWidget):
         name: str,
         value_label: Optional[QLabel],
     ) -> None:
-        """Handle int/float slider movement."""
+        """Handle int/float slider movement.
+
+        For integer parameters we map the discrete slider index back to the
+        real value using the stored min / max / step. This keeps the actual
+        parameter value consistent with the range declared in PluginParameter.
+        """
         # Decide if int or float based on stored bounds
         min_v = getattr(container, "_min", 0)
         step = getattr(container, "_step", 1)
 
         if isinstance(min_v, int):
-            # int
-            value = int(index)
+            # Integer parameter: map slider index -> value in [min_v, max_v]
+            max_v = getattr(container, "_max", min_v)
+            step_i = int(step) if step else 1
+            if step_i <= 0:
+                step_i = 1
+
+            value = int(min_v + index * step_i)
+            if value < min_v:
+                value = min_v
+            if value > int(max_v):
+                value = int(max_v)
+
             if value_label is not None:
                 value_label.setText(str(value))
         else:
-            # float
+            # Float parameter: map slider index -> value using min / step
             min_f = float(min_v)
-            step_f = float(step)
+            step_f = float(step) if step else 0.01
+            if step_f <= 0.0:
+                step_f = 0.01
+
             value = float(min_f + index * step_f)
             if value_label is not None:
                 value_label.setText(f"{value:.3g}")
 
         self._on_parameter_changed(name, value)
+
 
     def _on_parameter_changed(self, name: str, value: Any) -> None:
         """
@@ -1656,6 +1712,9 @@ class LyricsVisualizationsTab(QWidget):
             # Keep per-plugin parameters in memory
             if pid and self._current_plugin is not None:
                 cfg = dict(getattr(self._current_plugin, "config", {}) or {})
+                # Do not persist runtime-only `font_size` when using relative sizing.
+                if "font_size_rel" in cfg:
+                    cfg.pop("font_size", None)
                 self._plugin_params_by_id[pid] = cfg
 
             # Keep per-plugin routing in memory
@@ -1688,7 +1747,66 @@ class LyricsVisualizationsTab(QWidget):
             # Never crash UI because of save issues; silently ignore for now.
             pass
 
+    
     # ------------------------------------------------------------------
+    # Text-style helpers (Option A: relative font size)
+    # ------------------------------------------------------------------
+    def _apply_global_text_style_defaults(self, config: Dict[str, Any]) -> None:
+        """
+        Apply global text-style defaults stored in QSettings to *config*.
+
+        QSettings values are treated as *defaults*: they only fill missing keys
+        so that a project can still override the style in its own JSON.
+        """
+        for name in self._text_style_param_names:
+            if name in config:
+                continue
+            try:
+                # We do not force a type here: QSettings returns the same type
+                # that was originally stored (bool/int/float/str).
+                if self._settings.contains(f"lyrics/text_style/{name}"):
+                    config[name] = self._settings.value(f"lyrics/text_style/{name}")
+            except Exception:
+                pass
+
+        # Backward compatibility: if a project only stored `font_size` (legacy),
+        # initialize `font_size_rel` so the UI and exports can scale properly.
+        if "font_size_rel" not in config and isinstance(config.get("font_size"), (int, float)):
+            try:
+                config["font_size_rel"] = float(config.get("font_size", 40)) / 1080.0
+            except Exception:
+                pass
+
+    def _apply_runtime_font_scaling(self) -> None:
+        """
+        Update the runtime `font_size` in the active plugin config based on the
+        current widget height and the user-defined `font_size_rel`.
+
+        This does **not** persist anything to the project. It only helps plugins
+        that still rely on `config["font_size"]` (pixel size) to render text.
+        """
+        if self._current_plugin is None:
+            return
+        cfg = getattr(self._current_plugin, "config", None)
+        if not isinstance(cfg, dict):
+            return
+
+        rel = cfg.get("font_size_rel", None)
+        if not isinstance(rel, (int, float)):
+            return
+
+        h = int(self._current_plugin.height())
+        if h <= 0:
+            return
+
+        # Clamp to a sensible range to avoid accidental extremes.
+        rel_f = float(rel)
+        rel_f = max(0.005, min(0.30, rel_f))
+
+        px = int(round(rel_f * float(h)))
+        px = max(8, min(2000, px))
+        cfg["font_size"] = px
+# ------------------------------------------------------------------
     # Slots (UI callbacks)
     # ------------------------------------------------------------------
     def _on_plugin_combo_changed(self, index: int) -> None:

@@ -40,7 +40,7 @@ class TextWaveformVisualization(BaseLyricsVisualization):
         "Displays each word as a point on a horizontal text waveform, "
         "animated vertically by the audio amplitude."
     )
-    plugin_author: str = "App Olaf"
+    plugin_author: str = "DrDLP"
     plugin_version: str = "0.1.0"
 
     def __init__(
@@ -68,6 +68,11 @@ class TextWaveformVisualization(BaseLyricsVisualization):
 
         # Horizontal layout
         self.config.setdefault("horizontal_margin", 0.08)      # fraction of widget width
+        # Shared text anchor (0..1) - stored per plugin by the host.
+        # If the host does not inject these parameters yet, we still provide sane defaults.
+        self.config.setdefault("text_pos_x", 0.5)
+        self.config.setdefault("text_pos_y", 0.5)
+
 
         # Visual emphasis of past / future / active words
         self.config.setdefault("past_words_alpha", 1.0)
@@ -86,43 +91,10 @@ class TextWaveformVisualization(BaseLyricsVisualization):
     # ------------------------------------------------------------------
     @classmethod
     def parameters(cls) -> Dict[str, PluginParameter]:
-        """
-        Expose shared text-style parameters + plugin-specific controls.
-        """
+        """Expose shared text-style parameters + effect controls."""
         params = dict(text_style_parameters())
-
         params.update(
             {
-                # Background (same semantics as other plugins)
-                "background_mode": PluginParameter(
-                    name="background_mode",
-                    label="Background mode",
-                    type="enum",
-                    default="cover",
-                    choices=["cover", "solid", "gradient"],
-                    description="How to fill the background: cover, solid color, or gradient.",
-                ),
-                "background_color": PluginParameter(
-                    name="background_color",
-                    label="Background color",
-                    type="color",
-                    default="#000000",
-                    description="Background color when mode is 'solid'.",
-                ),
-                "background_gradient_top": PluginParameter(
-                    name="background_gradient_top",
-                    label="Gradient top color",
-                    type="color",
-                    default="#101010",
-                    description="Top color of the vertical gradient background.",
-                ),
-                "background_gradient_bottom": PluginParameter(
-                    name="background_gradient_bottom",
-                    label="Gradient bottom color",
-                    type="color",
-                    default="#402840",
-                    description="Bottom color of the vertical gradient background.",
-                ),
                 # Wave parameters
                 "wave_amplitude": PluginParameter(
                     name="wave_amplitude",
@@ -207,7 +179,6 @@ class TextWaveformVisualization(BaseLyricsVisualization):
                 ),
             }
         )
-
         return params
 
     # ------------------------------------------------------------------
@@ -400,18 +371,33 @@ class TextWaveformVisualization(BaseLyricsVisualization):
         margin_frac = float(self.config.get("horizontal_margin", 0.08))
         margin_frac = max(0.0, min(0.4, margin_frac))
 
-        usable_width = rect.width() * (1.0 - 2.0 * margin_frac)
-        x_offset = rect.left() + rect.width() * margin_frac
+        margin_px = rect.width() * margin_frac
+        usable_width = rect.width() - 2.0 * margin_px
 
-        # If the line is wider than the usable area, we still center the
-        # text, it may go closer to the edges.
-        if total_width < usable_width:
-            line_left = x_offset + (usable_width - total_width) / 2.0
+        # Preferred: host-provided helper from BaseLyricsVisualization.
+        # Fallback: normalized coordinates stored in this plugin config.
+        if hasattr(self, "get_text_anchor"):
+            anchor_x, anchor_y = self.get_text_anchor(rect)
         else:
-            line_left = rect.center().x() - total_width / 2.0
+            ax = float(self.config.get("text_pos_x", 0.5))
+            ay = float(self.config.get("text_pos_y", 0.5))
+            ax = max(0.0, min(1.0, ax))
+            ay = max(0.0, min(1.0, ay))
+            anchor_x = rect.left() + rect.width() * ax
+            anchor_y = rect.top() + rect.height() * ay
 
-        center_y = rect.center().y()
-        baseline_y = center_y
+        # Place the whole line so that its center sits on anchor_x.
+        line_left = float(anchor_x) - float(total_width) / 2.0
+
+        # If the line fits in the usable area, keep it inside margins.
+        if total_width <= usable_width:
+            min_left = rect.left() + margin_px
+            max_left = rect.right() - margin_px - total_width
+            if max_left >= min_left:
+                line_left = max(min_left, min(max_left, line_left))
+
+        baseline_y = float(anchor_y)
+
 
         # Wave parameters
         wave_amp_factor = float(self.config.get("wave_amplitude", 0.6))

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -24,7 +24,11 @@ from PyQt6.QtWidgets import (
     QSlider,
     QMessageBox,
     QSpinBox,
+    QFileDialog,
+    QMenu,
+    QApplication,
 )
+
 
 from .project_manager import Project
 from .visualizations_manager import VisualizationManager, VisualizationPluginInfo
@@ -329,6 +333,13 @@ class VisualizationsTab(QWidget):
         )
         size_row.addWidget(self.btn_preview_reset_defaults)
 
+        # Presets import/export (JSON)
+        self.btn_presets_all_plugins = QPushButton("All plugins…", self.preview_group)
+        self.btn_presets_current_plugin = QPushButton("Current plugin…", self.preview_group)
+
+        size_row.addWidget(self.btn_presets_all_plugins)
+        size_row.addWidget(self.btn_presets_current_plugin)
+
         self.preview_layout.addLayout(size_row)
 
         offset_help = QLabel(
@@ -402,6 +413,8 @@ class VisualizationsTab(QWidget):
         self.spin_tab_preview_fps.valueChanged.connect(self._on_preview_fps_changed)
         self.spin_tab_preview_offset.valueChanged.connect(self._on_preview_offset_changed)
         self.btn_preview_reset_defaults.clicked.connect(self._on_preview_reset_defaults)
+        self.btn_presets_all_plugins.clicked.connect(self._on_presets_all_plugins_clicked)
+        self.btn_presets_current_plugin.clicked.connect(self._on_presets_current_plugin_clicked)
 
 
     # ------------------------------------------------------------------ #
@@ -742,6 +755,373 @@ class VisualizationsTab(QWidget):
                     value_label.setText(f"{v:.3g}")
 
                 self._on_parameter_changed(name, v)
+
+    # ------------------------------------------------------------------ #
+    # Presets import / export (JSON + human summary)
+    # ------------------------------------------------------------------ #
+
+    def _on_presets_all_plugins_clicked(self) -> None:
+        """
+        Context menu for importing/exporting the whole 3D visualization presets
+        (all plugins at once).
+        """
+        if self._project is None:
+            QMessageBox.information(self, "No project", "Please select a project first.")
+            return
+
+        menu = QMenu(self)
+        act_export = menu.addAction("Export all plugins to JSON…")
+        act_import = menu.addAction("Import all plugins from JSON…")
+
+        pos = self.btn_presets_all_plugins.mapToGlobal(
+            self.btn_presets_all_plugins.rect().bottomRight()
+        )
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+
+        if chosen is act_export:
+            self._export_all_plugins_to_json()
+        elif chosen is act_import:
+            self._import_all_plugins_from_json()
+
+    def _on_presets_current_plugin_clicked(self) -> None:
+        """
+        Context menu for importing/exporting the current plugin preset and
+        copying a human-readable summary.
+        """
+        if self._project is None:
+            QMessageBox.information(self, "No project", "Please select a project first.")
+            return
+
+        if not self._current_plugin_id:
+            QMessageBox.information(self, "No plugin", "Please select a plugin first.")
+            return
+
+        menu = QMenu(self)
+        act_export = menu.addAction("Export current plugin to JSON…")
+        act_import = menu.addAction("Import preset from JSON…")
+        menu.addSeparator()
+        act_copy = menu.addAction("Copy human-readable summary")
+
+        pos = self.btn_presets_current_plugin.mapToGlobal(
+            self.btn_presets_current_plugin.rect().bottomRight()
+        )
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+
+        if chosen is act_export:
+            self._export_current_plugin_to_json()
+        elif chosen is act_import:
+            self._import_current_plugin_from_json()
+        elif chosen is act_copy:
+            self._copy_current_plugin_human_summary()
+
+    def _export_all_plugins_to_json(self) -> None:
+        """
+        Export ALL 3D visualization presets from the current project into a JSON file.
+
+        JSON structure:
+          {
+            "version": 1,
+            "project_name": "...",
+            "visualization_plugin_id": "...",
+            "visualizations": { "<plugin_id>": { "parameters": {...}, "routing": {...} }, ... }
+          }
+        """
+        if self._project is None:
+            return
+
+        # Ensure current UI changes are persisted
+        self._save_visualization_to_project()
+
+        base_dir = str(self._project.folder) if getattr(self._project, "folder", None) else ""
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export all plugins to JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        data = {
+            "version": 1,
+            "project_name": getattr(self._project, "name", None),
+            "visualization_plugin_id": getattr(self._project, "visualization_plugin_id", None),
+            "visualizations": dict(getattr(self._project, "visualizations", {}) or {}),
+        }
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", f"Could not write JSON file:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Export completed", f"Presets exported to:\n{file_name}")
+
+    def _import_all_plugins_from_json(self) -> None:
+        """
+        Import ALL 3D visualization presets into the current project from a JSON file.
+        This REPLACES the project's current 'visualizations' mapping.
+        """
+        if self._project is None:
+            return
+
+        base_dir = str(self._project.folder) if getattr(self._project, "folder", None) else ""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import all plugins from JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import error", f"Could not read JSON file:\n{exc}")
+            return
+
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "Invalid file", "The selected file is not a valid JSON object.")
+            return
+
+        visualizations = data.get("visualizations")
+        if not isinstance(visualizations, dict):
+            QMessageBox.warning(self, "Invalid format", "Missing or invalid 'visualizations' object.")
+            return
+
+        plugin_id = data.get("visualization_plugin_id")
+        if plugin_id is not None and not isinstance(plugin_id, str):
+            plugin_id = None
+
+        # Replace the project's presets
+        self._project.visualizations = dict(visualizations)
+        if plugin_id:
+            self._project.visualization_plugin_id = plugin_id
+
+        try:
+            self._project.save()
+        except Exception:
+            pass
+
+        # Refresh UI for current project / plugin
+        self._populate_stem_choices()
+        self._load_project_visualization_state()
+
+        QMessageBox.information(self, "Import completed", "All presets successfully imported.")
+
+    def _export_current_plugin_to_json(self) -> None:
+        """
+        Export current plugin preset to JSON.
+
+        JSON structure:
+          {
+            "version": 1,
+            "project_name": "...",
+            "plugin_id": "...",
+            "plugin_name": "...",
+            "state": { "parameters": {...}, "routing": {...} }
+          }
+        """
+        if self._project is None or not self._current_plugin_id:
+            return
+
+        # Ensure current UI changes are persisted
+        self._save_visualization_to_project()
+
+        plugin_id = self._current_plugin_id
+        info = self._manager.get_plugin(plugin_id)
+        plugin_name = info.name if info is not None else plugin_id
+
+        state = (getattr(self._project, "visualizations", {}) or {}).get(plugin_id, {})
+        if not isinstance(state, dict):
+            state = {}
+
+        base_dir = str(self._project.folder) if getattr(self._project, "folder", None) else ""
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export current plugin to JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        data = {
+            "version": 1,
+            "project_name": getattr(self._project, "name", None),
+            "plugin_id": plugin_id,
+            "plugin_name": plugin_name,
+            "state": state,
+        }
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export error", f"Could not write JSON file:\n{exc}")
+            return
+
+        QMessageBox.information(self, "Export completed", f"Preset exported to:\n{file_name}")
+
+    def _import_current_plugin_from_json(self) -> None:
+        """
+        Import a single plugin preset from JSON and store it into the project's
+        visualizations mapping. If the plugin exists in the current app, it is
+        selected automatically.
+        """
+        if self._project is None:
+            return
+
+        base_dir = str(self._project.folder) if getattr(self._project, "folder", None) else ""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import preset from JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(self, "Import error", f"Could not read JSON file:\n{exc}")
+            return
+
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "Invalid file", "The selected file is not a valid JSON object.")
+            return
+
+        plugin_id = data.get("plugin_id")
+        state = data.get("state")
+
+        if not isinstance(plugin_id, str) or not isinstance(state, dict):
+            QMessageBox.warning(
+                self,
+                "Invalid format",
+                "Missing or invalid 'plugin_id' and/or 'state' in JSON file.",
+            )
+            return
+
+        # Normalize state shape
+        parameters = state.get("parameters") if isinstance(state.get("parameters"), dict) else {}
+        routing = state.get("routing") if isinstance(state.get("routing"), dict) else {}
+        normalized_state = {"parameters": dict(parameters), "routing": dict(routing)}
+
+        if getattr(self._project, "visualizations", None) is None:
+            self._project.visualizations = {}
+
+        self._project.visualizations[plugin_id] = normalized_state
+        self._project.visualization_plugin_id = plugin_id
+
+        try:
+            self._project.save()
+        except Exception:
+            pass
+
+        # If plugin exists in combo, select it (triggers full restore)
+        idx = self.plugin_combo.findData(plugin_id)
+        if idx != -1:
+            self.plugin_combo.setCurrentIndex(idx)
+        else:
+            # Plugin not installed; still imported into project storage
+            self._populate_stem_choices()
+
+        QMessageBox.information(self, "Import completed", "Preset successfully imported.")
+
+    def _copy_current_plugin_human_summary(self) -> None:
+        """
+        Build a human-readable summary of the current plugin preset and copy it
+        to the system clipboard (intended for a forum / social media post).
+        """
+        if self._project is None or not self._current_plugin_id:
+            return
+
+        # Ensure current UI changes are persisted
+        self._save_visualization_to_project()
+
+        text = self._build_current_plugin_human_summary()
+        if not text:
+            QMessageBox.warning(self, "Summary error", "Could not build a summary for the current plugin.")
+            return
+
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+
+        QMessageBox.information(self, "Copied", "Human-readable summary copied to clipboard.")
+
+    def _build_current_plugin_human_summary(self) -> str:
+        """
+        Return a readable summary of the current plugin state:
+          - plugin id + name
+          - routing mapping (input_1 -> stem label)
+          - parameters (prefer plugin labels when available)
+        """
+        if self._project is None or not self._current_plugin_id:
+            return ""
+
+        plugin_id = self._current_plugin_id
+        info = self._manager.get_plugin(plugin_id)
+        plugin_name = info.name if info is not None else plugin_id
+
+        state = (getattr(self._project, "visualizations", {}) or {}).get(plugin_id, {}) or {}
+        parameters = state.get("parameters") if isinstance(state.get("parameters"), dict) else {}
+        routing = state.get("routing") if isinstance(state.get("routing"), dict) else {}
+
+        # Build label lookup for parameters (use PluginParameter.label if available)
+        param_labels: Dict[str, str] = {}
+        if info is not None and info.parameters:
+            for key, p in info.parameters.items():
+                label = (p.label or "").strip()
+                param_labels[key] = label if label else key
+
+        def _routing_key_to_label(key: str) -> str:
+            if not key:
+                return "(Not connected)"
+            if key == "full_mix":
+                return "Full mix (project audio)"
+            if ":" in key:
+                model, stem = key.split(":", 1)
+                return f"{model}: {stem}"
+            return key
+
+        lines: List[str] = []
+        lines.append(f"3D Visualization preset")
+        lines.append(f"- Project: {getattr(self._project, 'name', '')}")
+        lines.append(f"- Plugin: {plugin_name} ({plugin_id})")
+        lines.append("")
+
+        # Routing
+        if routing:
+            lines.append("Routing:")
+            for k in sorted(routing.keys()):
+                lines.append(f"- {k} -> {_routing_key_to_label(str(routing.get(k) or ''))}")
+            lines.append("")
+        else:
+            lines.append("Routing: (none)")
+            lines.append("")
+
+        # Parameters
+        if parameters:
+            lines.append("Parameters:")
+            # Sort by label (fallback to key)
+            keys = sorted(parameters.keys(), key=lambda x: (param_labels.get(x, x)).lower())
+            for k in keys:
+                label = param_labels.get(k, k)
+                v = parameters.get(k)
+                lines.append(f"- {label}: {v}")
+        else:
+            lines.append("Parameters: (none)")
+
+        return "\n".join(lines).strip()
 
     # ------------------------------------------------------------------ #
     # Persistence: plugin selection / params / routing in Project

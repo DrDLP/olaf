@@ -23,7 +23,12 @@ VISUAL_PACKAGES = [
     "numpy",          # usually already pulled by other deps but kept explicit
     "opencv-python",  # for glow / post-processing
     "skia-python",    # for high-quality 2D drawing
+    "vispy",          # for 3D GPU-accelerated, audio-reactive visualizations
+    "pyqtgraph",      # for 3D GPU-accelerated, audio-reactive visualizations
+    "pyopenGL",       # for 3D GPU-accelerated, audio-reactive visualizations  
+    "PyOpenGL_accelerate",       # for 3D GPU-accelerated, audio-reactive visualizations    
 ]
+
 
 # Additional packages required for the auto_clean audio script
 AUTO_CLEAN_PACKAGES = [

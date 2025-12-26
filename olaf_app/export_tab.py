@@ -44,6 +44,7 @@ from .cover_visualization_api import FrameFeatures, BaseCoverEffect
 from .visualizations_manager import VisualizationManager, VisualizationPluginInfo
 from .lyrics_visualizations_manager import LyricsVisualizationsManager  # <-- NEW
 from .lyrics_visualization_api import LyricsFrameContext, BaseLyricsVisualization  # <-- NEW
+from .lyrics_text_style import apply_default_text_style_config
 
 if TYPE_CHECKING:
     from .visualization_api import BaseVisualization
@@ -126,6 +127,10 @@ class ExportTab(QWidget):
         self._visual_manager.discover_plugins()
         self._visual_instances: Dict[str, "BaseVisualization"] = {}
         self._visual_widgets: Dict[str, QWidget] = {}
+        # Remember the FPS used to create each cached 3D visualization instance.
+        # Some plugins allocate GPU buffers based on FPS/time step; reusing across FPS changes
+        # can trigger OpenGL errors on certain drivers.
+        self._visual_fps: Dict[str, int] = {}
 
         # Lyrics visualization manager and cache (overlay on top of 2D / 3D)
         self._lyrics_manager = LyricsVisualizationsManager()
@@ -191,6 +196,7 @@ class ExportTab(QWidget):
         self._cover_effect_cache.clear()
         self._visual_instances.clear()
         self._visual_widgets.clear()
+        self._visual_fps.clear()
         self._lyrics_instances.clear()
         self._lyrics_phrases = []
         self._lyrics_words = []
@@ -591,9 +597,9 @@ class ExportTab(QWidget):
             self._on_canvas_height_slider_changed
         )
 
-        self.spin_width.valueChanged.connect(self._update_preview)
-        self.spin_height.valueChanged.connect(self._update_preview)
-        self.spin_fps.valueChanged.connect(self._update_preview)
+        self.spin_width.valueChanged.connect(self._on_output_width_changed)
+        self.spin_height.valueChanged.connect(self._on_output_height_changed)
+        self.spin_fps.valueChanged.connect(self._on_fps_changed)
         self.combo_visual_2d.currentIndexChanged.connect(self._update_preview)
         self.chk_enable_lyrics_overlay.toggled.connect(self._update_preview)
         self.combo_lyrics_plugin.currentIndexChanged.connect(self._update_preview)
@@ -625,8 +631,12 @@ class ExportTab(QWidget):
             self.slider_canvas_width.setValue(value)
             self.slider_canvas_width.blockSignals(False)
 
+        # New: changing canvas size invalidates 3D instances
+        self._reset_3d_visual_cache_on_canvas_change()
+  
         self._update_frame_slider_ranges()
         self._update_preview()
+
 
     def _on_canvas_width_slider_changed(self, value: int) -> None:
         ...
@@ -645,8 +655,12 @@ class ExportTab(QWidget):
             self.slider_canvas_height.setValue(value)
             self.slider_canvas_height.blockSignals(False)
 
+        # New: changing canvas size invalidates 3D instances
+        self._reset_3d_visual_cache_on_canvas_change()
+
         self._update_frame_slider_ranges()
         self._update_preview()
+
 
     def _on_canvas_height_slider_changed(self, value: int) -> None:
         ...
@@ -656,6 +670,61 @@ class ExportTab(QWidget):
             self.spin_canvas_height.blockSignals(False)
 
         self._update_frame_slider_ranges()
+        self._update_preview()
+
+    def _on_output_width_changed(self, value: int) -> None:
+        """
+        When the *output* video width changes, keep the canvas and
+        framing rectangle in sync with the same width.
+
+        - Canvas width  = output width
+        - Frame X       = 0
+        - Frame width   = output width
+        """
+        # Sync canvas width -> triggers _on_canvas_width_changed
+        if hasattr(self, "spin_canvas_width"):
+            self.spin_canvas_width.setValue(value)
+
+        # Sync framing rectangle horizontally
+        if hasattr(self, "spin_frame_x"):
+            self.spin_frame_x.setValue(0)
+        if hasattr(self, "spin_frame_w"):
+            self.spin_frame_w.setValue(value)
+        # Les spin_frame_* sont déjà connectés à _update_preview, donc
+        # la preview se mettra à jour automatiquement.
+
+    def _on_output_height_changed(self, value: int) -> None:
+        """
+        When the *output* video height changes, keep the canvas and
+        framing rectangle in sync with the same height.
+
+        - Canvas height = output height
+        - Frame Y       = 0
+        - Frame height  = output height
+        """
+        # Sync canvas height -> triggers _on_canvas_height_changed
+        if hasattr(self, "spin_canvas_height"):
+            self.spin_canvas_height.setValue(value)
+
+        # Sync framing rectangle verticalement
+        if hasattr(self, "spin_frame_y"):
+            self.spin_frame_y.setValue(0)
+        if hasattr(self, "spin_frame_h"):
+            self.spin_frame_h.setValue(value)
+        # Là aussi, les signaux existants déclenchent déjà _update_preview.
+
+
+    def _on_fps_changed(self, value: int) -> None:
+        """
+        When FPS changes, invalidate cached 3D visualization instances.
+
+        Some Vispy/OpenGL visuals allocate GPU buffers or internal time-step
+        state assuming a fixed FPS. Reusing an existing off-screen QOpenGLWidget
+        across FPS changes can trigger GL errors (e.g. GL_INVALID_VALUE) on
+        certain drivers.
+        """
+        # Reuse the same cache reset helper as for canvas size changes.
+        self._reset_3d_visual_cache_on_canvas_change()
         self._update_preview()
 
 
@@ -734,6 +803,19 @@ class ExportTab(QWidget):
             h = max(1, int(self.spin_height.value()))
         return w, h
 
+    def _reset_3d_visual_cache_on_canvas_change(self) -> None:
+        """
+        Drop cached 3D visualization instances/widgets so that the next
+        preview/export recreates them with the new canvas size.
+
+        This avoids resizing existing QOpenGLWidgets during a running
+        export loop, which can trigger GL_INVALID_OPERATION on some
+        OpenGL/driver combinations.
+        """
+        self._visual_instances.clear()
+        self._visual_widgets.clear()
+        self._visual_fps.clear()
+
     def _update_frame_slider_ranges(self) -> None:
         """
         Keep frame X/Y sliders consistent with the current canvas size.
@@ -748,6 +830,58 @@ class ExportTab(QWidget):
             self.slider_frame_y.blockSignals(True)
             self.slider_frame_y.setRange(0, max(0, canvas_h))
             self.slider_frame_y.blockSignals(False)
+
+    def _run_ffmpeg_with_events(self, cmd: List[str]) -> None:
+        """
+        Run an ffmpeg command while keeping the Qt event loop responsive.
+
+        IMPORTANT:
+        - We do NOT pipe stdout/stderr to avoid deadlocks when ffmpeg
+          produces a lot of log output.
+        - We just monitor the process and keep pumping Qt events so the
+          UI stays responsive during the encoding step.
+
+        Raises
+        ------
+        RuntimeError
+            If ffmpeg exits with a non-zero return code.
+        """
+        try:
+            import subprocess
+        except ImportError:  # pragma: no cover
+            raise RuntimeError("subprocess module is not available.")
+
+        # Let ffmpeg inherit the parent's stdout/stderr (or OS defaults)
+        # so that its logs do not fill a PIPE and block the process.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Poll loop: keep the UI responsive during encoding
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
+            QApplication.processEvents()
+
+        if proc.returncode != 0:
+            raise RuntimeError("ffmpeg failed with non-zero return code.")
+
+
+    def _reset_3d_visual_cache_on_canvas_change(self) -> None:
+        """
+        Drop cached 3D visualization instances/widgets so that the next
+        preview/export recreates them with the new canvas size.
+
+        This avoids resizing existing QOpenGLWidgets during a running
+        export loop, which can trigger GL_INVALID_OPERATION on some
+        OpenGL/driver combinations.
+        """
+        self._visual_instances.clear()
+        self._visual_widgets.clear()
+        self._visual_fps.clear()
 
     def _get_output_size(self) -> Tuple[int, int]:
         """
@@ -1187,11 +1321,20 @@ class ExportTab(QWidget):
 
             # 1) Render a single canvas frame (2D or 3D) -----------------
             if isinstance(mode, str) and mode.startswith("3d:"):
-                # 3D visualization preview (static frame at t = 0)
+                # 3D visualization preview: render a static frame at t=0
+                # using the selected Vispy plugin. If anything fails, we
+                # gracefully fall back to a simple base frame (cover / noir).
                 plugin_id = mode.split(":", 1)[1]
                 canvas_img = self._render_3d_preview_frame(
-                    plugin_id, canvas_preview_w, canvas_preview_h
+                    plugin_id,
+                    canvas_preview_w,
+                    canvas_preview_h,
                 )
+                if canvas_img is None:
+                    canvas_img = self._make_base_frame(
+                        canvas_preview_w,
+                        canvas_preview_h,
+                    )
             else:
                 # 2D cover chain preview
                 chain = getattr(self._project, "cover_visual_chain", None) or []
@@ -1208,6 +1351,7 @@ class ExportTab(QWidget):
                     t=preview_t,
                     amp=0.8,
                 )
+
 
             if canvas_img is None:
                 canvas_img = self._make_base_frame(canvas_preview_w, canvas_preview_h)
@@ -1491,28 +1635,36 @@ class ExportTab(QWidget):
           - Mouse press: start moving/resizing the framing rectangle.
           - Mouse move: update rectangle.
           - Mouse release: stop interaction.
-          - Resize: recompute preview to match new size.
+
+        We intentionally do **not** re-render the preview on every
+        Resize event of the label, to avoid feedback between layout
+        resizes and preview scaling that can cause a continuous
+        zooming / breathing effect.
         """
         if obj is self.preview_label:
             et = event.type()
 
-            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            if (
+                et == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
                 self._start_frame_drag(event.pos())
-                # On laisse QLabel gérer le reste, donc on renvoie False
                 return False
 
             if et == QEvent.Type.MouseMove and self._dragging_frame:
                 self._update_frame_drag(event.pos())
                 return False
 
-            if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            if (
+                et == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
                 self._end_frame_drag()
                 return False
 
             if et == QEvent.Type.Resize:
-                # Quand la preview change de taille, on recalcule l'image
-                if self._project is not None:
-                    self._update_preview()
+                # Do not trigger a full preview recompute here to avoid
+                # auto-zoom / breathing effects caused by layout feedback.
                 return False
 
         return super().eventFilter(obj, event)
@@ -1564,8 +1716,8 @@ class ExportTab(QWidget):
         """
         Build a LyricsFrameContext at time t using phrases/words alignment.
 
-        This mirrors the logic used in LyricsVisualizationsTab so that
-        export and live preview share exactly the same behavior.
+        Mirrors the live preview logic (LyricsVisualizationsTab).
+        Robust to repeated words ("the ... the") and to edits that may reorder words.
         """
         phrase_index: Optional[int] = None
         phrase_obj: Optional[Dict[str, Any]] = None
@@ -1588,7 +1740,6 @@ class ExportTab(QWidget):
                 break
 
         if phrase_obj is None:
-            # Outside of any phrase -> empty context
             return LyricsFrameContext(
                 t=t,
                 amp=amp,
@@ -1606,54 +1757,105 @@ class ExportTab(QWidget):
         local_phrase_time = max(0.0, t - phrase_start)
         phrase_duration = max(0.0, phrase_end - phrase_start)
 
-        # 2) Determine line_index for words
+        # 2) Collect words for this line
         line_index = phrase_obj.get("line_index", phrase_index)
 
-        # All words for this line, in temporal order
-        line_words: List[Tuple[int, Dict[str, Any]]] = []
+        raw_line_words: List[Tuple[int, Dict[str, Any]]] = []
         for gidx, w in enumerate(self._lyrics_words or []):
             if w.get("line_index", line_index) != line_index:
                 continue
-            line_words.append((gidx, w))
+            raw_line_words.append((gidx, w))
+
+        def _safe_f(x: Any, default: float = 0.0) -> float:
+            try:
+                return float(x)
+            except Exception:
+                return float(default)
+
+        def _safe_i(x: Any, default: int = -1) -> int:
+            try:
+                return int(x)
+            except Exception:
+                return int(default)
+
+        by_time = sorted(
+            raw_line_words,
+            key=lambda it: (
+                _safe_f(it[1].get("start", 0.0), 0.0),
+                _safe_f(it[1].get("end", it[1].get("start", 0.0)), 0.0),
+                it[0],
+            ),
+        )
+        time_rank: dict[int, int] = {gidx: i for i, (gidx, _) in enumerate(by_time)}
+
+        by_text = sorted(
+            raw_line_words,
+            key=lambda it: (
+                (_safe_i(it[1].get("word_index", -1), -1) if _safe_i(it[1].get("word_index", -1), -1) >= 0 else time_rank.get(it[0], 10**9)),
+                time_rank.get(it[0], 10**9),
+                it[0],
+            ),
+        )
 
         # 3) Find active word by timing
         current_word_text: Optional[str] = None
         current_word_global_idx: Optional[int] = None
 
-        for gidx, w in line_words:
-            try:
-                ws = float(w.get("start", 0.0))
-                we = float(w.get("end", ws))
-            except Exception:
-                continue
+        candidates: list[tuple[float, float, int, Dict[str, Any]]] = []
+        for gidx, w in by_time:
+            ws = _safe_f(w.get("start", 0.0), 0.0)
+            we = _safe_f(w.get("end", ws), ws)
             if ws <= t <= we:
-                current_word_text = str(w.get("text", ""))
-                current_word_global_idx = gidx
-                break
+                candidates.append((ws, we, gidx, w))
 
-        # 4) Compute occurrence index of the active word inside the phrase
+        if candidates:
+            ws, we, gidx, w = sorted(candidates, key=lambda it: (-it[0], it[1], it[2]))[0]
+            _ = (ws, we)
+            current_word_text = str(w.get("text", ""))
+            current_word_global_idx = int(gidx)
+
+        # 4) Map to character offsets (token-aware + repeated words)
         word_char_start: Optional[int] = None
         word_char_end: Optional[int] = None
+
+        def _is_word_char(ch: str) -> bool:
+            return ch.isalnum() or ch in ("_", "-", "'", "’")
+
+        def _find_nth_exact_token(haystack: str, needle: str, n: int) -> int:
+            if not needle:
+                return -1
+            count = 0
+            i = 0
+            L = len(needle)
+
+            while True:
+                j = haystack.find(needle, i)
+                if j < 0:
+                    return -1
+
+                left_ok = (j == 0) or (not _is_word_char(haystack[j - 1]))
+                right_i = j + L
+                right_ok = (right_i >= len(haystack)) or (not _is_word_char(haystack[right_i]))
+
+                if left_ok and right_ok:
+                    if count == n:
+                        return j
+                    count += 1
+
+                i = j + L
 
         if current_word_text and current_word_global_idx is not None:
             lower_line = text_full_line.lower()
             lower_word = current_word_text.lower()
 
             occurrence_index = 0
-            for gidx, w in line_words:
+            for gidx, w in by_text:
                 if gidx == current_word_global_idx:
                     break
                 if str(w.get("text", "")).lower() == lower_word:
                     occurrence_index += 1
 
-            pos = -1
-            start_search = 0
-            for _ in range(occurrence_index + 1):
-                pos = lower_line.find(lower_word, start_search)
-                if pos < 0:
-                    break
-                start_search = pos + len(lower_word)
-
+            pos = _find_nth_exact_token(lower_line, lower_word, occurrence_index)
             if pos >= 0:
                 word_char_start = pos
                 word_char_end = pos + len(lower_word)
@@ -1670,7 +1872,6 @@ class ExportTab(QWidget):
             word_char_start=word_char_start,
             word_char_end=word_char_end,
         )
-
 
     # ------------------------------------------------------------------
     # Envelope helpers
@@ -1934,28 +2135,32 @@ class ExportTab(QWidget):
         self, plugin_id: str, width: int, height: int, fps: int
     ) -> Tuple["BaseVisualization", QWidget]:
         """
-        Lazily create (or reuse) a 3D visualization instance and its
-        off-screen widget for the given resolution and FPS.
+        Lazily create (or reuse) a 3D visualization instance and its off-screen
+        widget for the given resolution and FPS.
 
-        The widget is kept as a *child* of this tab (so the OpenGL context
-        is valid) but its geometry is moved outside of the visible area so
-        it never appears on screen. We still grab() its contents to build
-        preview / export frames.
+        Why we may recreate on demand:
+        - Some Vispy visuals allocate GPU buffers sized from the widget geometry.
+          Reusing a widget created at a different size would force us to upscale,
+          and can also trigger OpenGL errors on some drivers.
+        - A few plugins also assume a fixed FPS/time step; reusing the same
+          instance across FPS changes can lead to invalid GL buffer updates.
 
-        IMPORTANT:
-        Even when reusing an existing instance, we re-synchronize its
-        configuration from the Project.visualizations[...] parameters so
-        that changes made in the Visualizations tab are reflected in the
-        export.
+        NOTE:
+        We deliberately do NOT call instance.apply_preview_settings() here,
+        to avoid resizing a QOpenGLWidget while Vispy is drawing.
         """
         if self._project is None:
             raise RuntimeError("No project selected.")
 
-        # Always fetch latest saved state from the project
+        req_w = max(1, int(width))
+        req_h = max(1, int(height))
+        req_fps = max(1, int(fps))
+
+        # Always fetch latest saved state from the project (parameters only).
         visualizations: Dict[str, Dict[str, Any]] = getattr(
             self._project, "visualizations", {}
         ) or {}
-        state = visualizations.get(plugin_id, {})
+        state = visualizations.get(plugin_id, {}) or {}
         params = state.get("parameters") or {}
 
         # ------------------------------------------------------------------
@@ -1964,28 +2169,53 @@ class ExportTab(QWidget):
         if plugin_id in self._visual_instances:
             instance = self._visual_instances[plugin_id]
             widget = self._visual_widgets.get(plugin_id)
+            cached_fps = self._visual_fps.get(plugin_id)
 
-            # Re-synchronize instance.config with latest project parameters
+            needs_recreate = (
+                widget is None
+                or widget.width() != req_w
+                or widget.height() != req_h
+                or (cached_fps is not None and int(cached_fps) != req_fps)
+            )
+
+            if not needs_recreate:
+                # Re-synchronize instance.config with latest project parameters
+                try:
+                    cfg = getattr(instance, "config", {}) or {}
+                    cfg.update(params)
+                    # Provide FPS as a non-invasive hint for plugins that need it.
+                    cfg.setdefault("fps", req_fps)
+                except Exception:
+                    pass
+
+                if not widget.isVisible():
+                    widget.show()
+                return instance, widget
+
+            # Best-effort teardown of the old widget/instance
             try:
-                cfg = getattr(instance, "config", {}) or {}
-                cfg.update(params)
+                if widget is not None:
+                    widget.hide()
+                    widget.close()
+                    widget.deleteLater()
             except Exception:
                 pass
 
-            if widget is not None:
-                # Keep a fixed off-screen geometry so it never overlaps the UI
-                widget.setGeometry(-width - 50, -height - 50, width, height)
-                widget.setMinimumSize(width, height)
-                widget.setMaximumSize(width, height)
-
             try:
-                instance.apply_preview_settings(width, height, fps)  # type: ignore[attr-defined]
+                if hasattr(instance, "on_deactivate"):
+                    instance.on_deactivate()  # type: ignore[attr-defined]
             except Exception:
                 pass
 
-            if widget is None:
-                raise RuntimeError("Visualization widget is missing.")
-            return instance, widget
+            try:
+                if hasattr(instance, "close"):
+                    instance.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+            self._visual_instances.pop(plugin_id, None)
+            self._visual_widgets.pop(plugin_id, None)
+            self._visual_fps.pop(plugin_id, None)
 
         # ------------------------------------------------------------------
         # Fresh instance from plugin metadata saved in the project
@@ -2002,20 +2232,16 @@ class ExportTab(QWidget):
         try:
             cfg = getattr(instance, "config", {}) or {}
             cfg.update(params)
+            cfg.setdefault("fps", req_fps)
         except Exception:
             pass
 
-        # Off-screen widget: child of this tab, but moved outside visible area
         widget = instance.create_widget(self)  # type: ignore[attr-defined]
-        widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-        widget.setGeometry(-width - 50, -height - 50, width, height)
-        widget.setMinimumSize(width, height)
-        widget.setMaximumSize(width, height)
+        widget.setGeometry(-req_w - 50, -req_h - 50, req_w, req_h)
+        widget.setMinimumSize(req_w, req_h)
+        widget.setMaximumSize(req_w, req_h)
+        widget.show()  # ensure GL context is created
 
-        try:
-            instance.apply_preview_settings(width, height, fps)  # type: ignore[attr-defined]
-        except Exception:
-            pass
         try:
             instance.on_activate()  # type: ignore[attr-defined]
         except Exception:
@@ -2023,8 +2249,8 @@ class ExportTab(QWidget):
 
         self._visual_instances[plugin_id] = instance
         self._visual_widgets[plugin_id] = widget
+        self._visual_fps[plugin_id] = req_fps
         return instance, widget
-
 
     def _render_3d_preview_frame(
         self, plugin_id: str, width: int, height: int
@@ -2032,44 +2258,115 @@ class ExportTab(QWidget):
         """
         Render a single static preview frame for the given 3D plugin.
 
-        We do not depend on real audio here; instead we send a synthetic
-        feature vector with a moderate RMS so the plugin shows its look.
+        Some 3D plugins (SurfacePlot/mesh-style) are sensitive to missing audio keys.
+        For preview, we provide a "compat" payload with safe defaults to reduce
+        the chance of GL buffer update errors on the very first draw.
+
+        Any OpenGL / Vispy errors are caught to avoid crashing the UI.
         """
+        if self._project is None:
+            return None
+
+        # Sanity guard: avoid creating 0-sized GL surfaces (can trigger GL errors).
+        if width < 2 or height < 2:
+            return None
+
         try:
             fps = max(1, int(self.spin_fps.value()))
             instance, widget = self._get_or_create_visualization_instance(
                 plugin_id, width, height, fps
             )
-        except Exception:
+        except Exception as exc:
+            print(
+                f"[Olaf] Failed to create visualization instance for preview: {exc}",
+                file=sys.stderr,
+            )
             return None
 
+        # Build a small "compat" audio features payload:
+        # - keep the existing 'inputs -> rms' contract,
+        # - add a few common keys used by surface/mesh visuals.
         visualizations: Dict[str, Dict[str, Any]] = getattr(
             self._project, "visualizations", {}
         ) or {}
         state = visualizations.get(plugin_id, {})
         routing = state.get("routing") or {}
 
-        inputs: Dict[str, Dict[str, float]] = {}
-        if routing:
-            for input_key in routing.keys():
-                inputs[input_key] = {"rms": 0.8}
-        else:
-            inputs["input_1"] = {"rms": 0.8}
-
-        features = {"time_ms": 0, "inputs": inputs}
         try:
-            instance.on_audio_features(features)  # type: ignore[attr-defined]
+            dt = 1.0 / float(fps)
+        except Exception:
+            dt = 1.0 / 30.0
+
+        # Common shapes (small, fast, deterministic)
+        spec_bins = 64
+        band_bins = 16
+        try:
+            spectrum_zeros = np.zeros((spec_bins,), dtype=np.float32)
+            bands_zeros = np.zeros((band_bins,), dtype=np.float32)
+        except Exception:
+            spectrum_zeros = [0.0] * spec_bins
+            bands_zeros = [0.0] * band_bins
+
+        inputs: Dict[str, Dict[str, Any]] = {}
+        keys = list(routing.keys()) if routing else ["input_1"]
+        for input_key in keys:
+            inputs[str(input_key)] = {
+                "rms": 0.8,
+                "peak": 0.8,
+                "spectrum": spectrum_zeros,
+                "bands": bands_zeros,
+            }
+
+        features: Dict[str, Any] = {
+            "time_ms": 0,
+            "time_sec": 0.0,
+            "fps": fps,
+            "dt": dt,
+            "inputs": inputs,
+        }
+
+        # Make Vispy more tolerant during preview: do not let draw callbacks crash
+        # the Qt paint pipeline (some drivers raise on "periodic check").
+        try:
+            canvas = getattr(instance, "canvas", None)
+            if canvas is not None and hasattr(canvas, "events"):
+                for evt_name in ("draw", "paint"):
+                    emitter = getattr(canvas.events, evt_name, None)
+                    if emitter is not None and hasattr(emitter, "ignore_callback_errors"):
+                        emitter.ignore_callback_errors = True
         except Exception:
             pass
 
-        QApplication.processEvents()
-        pix = widget.grab()
-        if pix.isNull():
+        try:
+            instance.on_audio_features(features)  # type: ignore[attr-defined]
+        except Exception as exc:
+            print(
+                f"[Olaf] visualization on_audio_features (preview) error: {exc}",
+                file=sys.stderr,
+            )
+
+        # Force at least one paint before grabbing
+        try:
+            widget.update()
+            widget.repaint()
+        except Exception:
+            pass
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        # Grab the widget contents safely
+        try:
+            pix = widget.grab()
+        except Exception as exc:
+            print(
+                f"[Olaf] Failed to grab 3D preview frame: {exc}",
+                file=sys.stderr,
+            )
             return None
 
-        img = pix.toImage().convertToFormat(QImage.Format.Format_RGB32)
-        
-        pix = widget.grab()
         if pix.isNull():
             return None
 
@@ -2083,8 +2380,8 @@ class ExportTab(QWidget):
                 Qt.AspectRatioMode.IgnoreAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-        return img
 
+        return img
 
     # ------------------------------------------------------------------
     # 3D export helpers: stems → RMS envelopes → frames
@@ -2182,19 +2479,29 @@ class ExportTab(QWidget):
     ) -> Optional[QImage]:
         """
         Render a single 3D visualization frame at the given time.
+
+        The frame is rendered off-screen using the visualization plugin's
+        widget, then grabbed as a QImage.
+
+        Any OpenGL / Vispy errors during the grab are caught so that a
+        single bad frame does not crash the whole export.
         """
         if self._project is None:
             return None
 
+        # Create or reuse the off-screen 3D visualization instance + widget
         try:
             instance, widget = self._get_or_create_visualization_instance(
                 plugin_id, width, height, fps
             )
-        except Exception:
+        except Exception as exc:
+            print(f"[Olaf] Failed to create visualization instance: {exc}", file=sys.stderr)
             return None
 
+        # Frame index for RMS envelopes
         frame_index = max(0, int(round(time_sec * fps)))
 
+        # Build per-input RMS values for this frame
         inputs: Dict[str, Dict[str, float]] = {}
         for input_key, rms_arr in envelopes.items():
             if rms_arr.size == 0:
@@ -2208,19 +2515,27 @@ class ExportTab(QWidget):
             "time_ms": int(round(time_sec * 1000.0)),
             "inputs": inputs,
         }
+
+        # Let the plugin update its internal state for this time slice
         try:
             instance.on_audio_features(features)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        except Exception as exc:
+            # Plugin errors must not kill the export
+            print(f"[Olaf] visualization on_audio_features error: {exc}", file=sys.stderr)
 
+        # Let Qt/Vispy process the draw before grabbing
         QApplication.processEvents()
-        pix = widget.grab()
-        if pix.isNull():
+
+        # Grab the widget contents as a pixmap, guarding against GL crashes
+        try:
+            pix = widget.grab()
+        except Exception as exc:
+            print(
+                f"[Olaf] Failed to grab 3D export frame at t={time_sec:.3f}s: {exc}",
+                file=sys.stderr,
+            )
             return None
 
-        img = pix.toImage().convertToFormat(QImage.Format.Format_RGB32)
-        
-        pix = widget.grab()
         if pix.isNull():
             return None
 
@@ -2234,6 +2549,7 @@ class ExportTab(QWidget):
                 Qt.AspectRatioMode.IgnoreAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
+
         return img
 
     # ------------------------------------------------------------------
@@ -2280,6 +2596,67 @@ class ExportTab(QWidget):
             return str(routing.get("audio_source", "main"))
         return "main"
 
+
+    def _sync_lyrics_anchor_keys(self, config: Dict[str, Any]) -> None:
+        """
+        Keep legacy anchor keys (center_x/center_y) and the new shared
+        anchor keys (text_pos_x/text_pos_y) in sync.
+
+        Some older lyrics plugins still read `center_x/center_y` directly.
+        Newer ones should use `text_pos_x/text_pos_y` (via get_text_anchor()).
+        This helper makes both styles behave consistently.
+        """
+        if not isinstance(config, dict):
+            return
+
+        def _pick(name_new: str, name_old: str, default: float) -> float:
+            val = config.get(name_new, config.get(name_old, default))
+            try:
+                return float(val)
+            except Exception:
+                return float(default)
+
+        x = _pick('text_pos_x', 'center_x', 0.5)
+        y = _pick('text_pos_y', 'center_y', 0.5)
+
+        x = max(0.0, min(1.0, x))
+        y = max(0.0, min(1.0, y))
+
+        config['text_pos_x'] = x
+        config['text_pos_y'] = y
+        config['center_x'] = x
+        config['center_y'] = y
+
+    def _apply_runtime_font_scaling_to_config(
+        self,
+        config: Dict[str, Any],
+        target_height: int,
+    ) -> None:
+        """
+        Compute and inject a concrete `font_size` (pixels) into a lyrics plugin
+        config from `font_size_rel` and the current render height.
+
+        This mirrors LyricsVisualizationsTab._apply_runtime_font_scaling() so
+        exports scale text correctly with the *output* resolution.
+        """
+        if not isinstance(config, dict):
+            return
+
+        rel = config.get('font_size_rel', None)
+        if not isinstance(rel, (int, float)):
+            return
+
+        h = int(target_height)
+        if h <= 0:
+            return
+
+        rel_f = float(rel)
+        rel_f = max(0.005, min(0.30, rel_f))
+
+        px = int(round(rel_f * float(h)))
+        px = max(8, min(2000, px))
+        config['font_size'] = px
+
     def _get_or_create_lyrics_instance(
         self,
         plugin_id: str,
@@ -2306,6 +2683,12 @@ class ExportTab(QWidget):
                 self._project, "lyrics_visual_parameters", {}
             ) or {}
             config = dict(params_by_plugin.get(plugin_id) or global_params or {})
+
+            # Ensure shared text-style defaults exist (and migrate legacy keys)
+            apply_default_text_style_config(config)
+            self._sync_lyrics_anchor_keys(config)
+            self._apply_runtime_font_scaling_to_config(config, height)
+
 
             instance = self._lyrics_manager.create_instance(
                 plugin_id, config=config, parent=self
@@ -2338,6 +2721,12 @@ class ExportTab(QWidget):
                     self._project, "lyrics_visual_parameters", {}
                 ) or {}
                 config = dict(params_by_plugin.get(plugin_id) or global_params or {})
+
+                # Ensure shared text-style defaults exist (and migrate legacy keys)
+                apply_default_text_style_config(config)
+                self._sync_lyrics_anchor_keys(config)
+                self._apply_runtime_font_scaling_to_config(config, height)
+
                 instance.load_state(config)
             except Exception:
                 pass
@@ -2413,6 +2802,13 @@ class ExportTab(QWidget):
             pass
 
         try:
+            # Ensure runtime scaling and anchor keys are consistent with the output size
+            cfg = getattr(instance, 'config', None)
+            if isinstance(cfg, dict):
+                apply_default_text_style_config(cfg)
+                self._sync_lyrics_anchor_keys(cfg)
+                self._apply_runtime_font_scaling_to_config(cfg, base_img.height())
+
             instance.update_frame(ctx)
         except Exception:
             return base_img
@@ -2500,6 +2896,13 @@ class ExportTab(QWidget):
             pass
 
         try:
+            # Ensure runtime scaling and anchor keys are consistent with the output size
+            cfg = getattr(instance, 'config', None)
+            if isinstance(cfg, dict):
+                apply_default_text_style_config(cfg)
+                self._sync_lyrics_anchor_keys(cfg)
+                self._apply_runtime_font_scaling_to_config(cfg, base_img.height())
+
             instance.update_frame(ctx)
         except Exception:
             return base_img
@@ -2740,8 +3143,9 @@ class ExportTab(QWidget):
             width, height = self._get_output_size()
 
             # Freeze framing rectangle and lyrics settings for this export
-            frame_rect = self._compute_output_frame_rect(canvas_w, canvas_h, width, height)
-
+            #Íframe_rect = self._compute_output_frame_rect(canvas_w, canvas_h, width, height)
+            frame_rect = QRect(0, 0, canvas_w, canvas_h)
+            
             lyrics_enabled = self._lyrics_overlay_enabled()
             lyrics_plugin_id: Optional[str] = None
             lyrics_env: Optional[AudioEnvelope] = None
@@ -2999,8 +3403,6 @@ class ExportTab(QWidget):
 
 
             try:
-                import subprocess
-
                 cmd = [
                     "ffmpeg",
                     "-y",
@@ -3026,16 +3428,9 @@ class ExportTab(QWidget):
                     str(output_path),
                 ]
 
-                result = subprocess.run(
-                    cmd,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        result.stderr.decode(errors="ignore") or "ffmpeg failed"
-                    )
+                # Run ffmpeg while keeping the Qt event loop alive
+                self._run_ffmpeg_with_events(cmd)
+
             except FileNotFoundError:
                 self.btn_export.setEnabled(True)
                 self.btn_stop_export.setEnabled(False)
@@ -3098,9 +3493,11 @@ class ExportTab(QWidget):
         """
         Export a video driven by a 3D visualization plugin.
 
-        Frames are rendered off-screen from the selected plugin using
-        RMS envelopes according to its saved stem routing. Audio is the
-        main project mix, trimmed to the selected section.
+        For 3D visuals (Vispy), we render directly at the final output
+        resolution and do NOT apply additional canvas cropping, because
+        the visualization already defines its own framing and camera.
+
+        Audio is the main project mix, trimmed to the selected section.
         """
         if self._project is None:
             QMessageBox.warning(
@@ -3132,15 +3529,19 @@ class ExportTab(QWidget):
 
         fps = max(1, self.spin_fps.value())
 
-        # Canvas = résolution interne de rendu 3D
+        # For 3D export we render at the same internal canvas resolution
+        # used everywhere else (preview, visualizations tab), then we
+        # scale once to the final output size. This avoids any change
+        # in apparent zoom between live view and exported video.
         canvas_w, canvas_h = self._get_canvas_size()
-
-        # Output = résolution finale encodée
         width, height = self._get_output_size()
 
-        # Freeze framing rectangle and lyrics settings for this export
-        frame_rect = self._compute_output_frame_rect(canvas_w, canvas_h, width, height)
+        # For 3D visuals we still do NOT apply any extra framing:
+        # we always use the full canvas as the source region.
+        frame_rect = QRect(0, 0, canvas_w, canvas_h)
 
+
+        # Freeze lyrics settings for this export
         lyrics_enabled = self._lyrics_overlay_enabled()
         lyrics_plugin_id: Optional[str] = None
         lyrics_env: Optional[AudioEnvelope] = None
@@ -3171,7 +3572,6 @@ class ExportTab(QWidget):
         self.btn_stop_and_encode.setEnabled(True)
         self.progress_export.setText("Computing 3D envelopes...")
         QApplication.processEvents()
-
 
         try:
             main_env = self._ensure_audio_envelope(audio_path, fps)
@@ -3257,7 +3657,6 @@ class ExportTab(QWidget):
             self.btn_export.setEnabled(True)
             self.btn_stop_export.setEnabled(False)
             self.btn_stop_and_encode.setEnabled(False)
-
             return
 
         output_path = Path(out_str)
@@ -3277,7 +3676,7 @@ class ExportTab(QWidget):
 
             t = start_time + idx / float(fps)
 
-            # 1) Canvas frame (3D rendu à la résolution du canvas)
+            # 1) Canvas frame (3D rendered directly at output resolution)
             canvas_img = self._render_visualization_frame(
                 plugin_id,
                 canvas_w,
@@ -3289,7 +3688,8 @@ class ExportTab(QWidget):
             if canvas_img is None:
                 canvas_img = self._make_base_frame(canvas_w, canvas_h)
 
-            # 2) Cadrage canvas -> frame de sortie
+            # 2) No extra cropping: we keep the full canvas.
+            # frame_rect is (0,0,width,height), same as canvas.
             out_img = self._extract_output_frame_from_canvas(
                 canvas_img,
                 frame_rect,
@@ -3297,7 +3697,7 @@ class ExportTab(QWidget):
                 height,
             )
 
-            # 3) Overlay paroles dans la résolution finale (settings figés)
+            # 3) Apply lyrics overlay (if enabled) on the final frame
             out_img = self._apply_lyrics_overlay_for_export(
                 out_img,
                 time_sec=t,
@@ -3307,8 +3707,7 @@ class ExportTab(QWidget):
                 env=lyrics_env,
             )
 
-            # Live feedback: show the current 3D frame in the preview label
-            # (throttled to reduce preview overhead).
+            # Live feedback in preview (throttled)
             try:
                 if idx % 10 == 0 or idx == n_frames - 1:
                     pix = QPixmap.fromImage(out_img)
@@ -3324,7 +3723,6 @@ class ExportTab(QWidget):
                     self.preview_label.setPixmap(pix)
                     self.preview_label.setText("")
             except Exception:
-                # Do not interrupt export if preview fails
                 pass
 
             frame_path = frames_dir / f"frame_{idx:06d}.png"
@@ -3334,8 +3732,7 @@ class ExportTab(QWidget):
             self.progress_export.setText(f"Rendering 3D frames... ({progress}%)")
             QApplication.processEvents()
 
-
-        # How many frames did we actually render?
+        # How many frames actually rendered?
         generated_frames = len(list(frames_dir.glob("frame_*.png")))
 
         if self._export_cancelled and not self._export_keep_partial:
@@ -3369,10 +3766,7 @@ class ExportTab(QWidget):
         self.progress_export.setText("Encoding 3D video via ffmpeg...")
         QApplication.processEvents()
 
-
         try:
-            import subprocess
-
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -3398,15 +3792,9 @@ class ExportTab(QWidget):
                 str(output_path),
             ]
 
-            result = subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            if result.returncode != 0:
-                message = result.stderr.decode(errors="ignore") or "ffmpeg failed"
-                raise RuntimeError(message)
+            # Run ffmpeg while keeping the UI responsive
+            self._run_ffmpeg_with_events(cmd)
+
         except FileNotFoundError:
             self.btn_export.setEnabled(True)
             self.btn_stop_export.setEnabled(False)

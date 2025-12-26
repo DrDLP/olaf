@@ -15,8 +15,8 @@ All comments are in English as this project is intended to be shared on GitHub.
 from typing import Any, Dict, List
 from pathlib import Path
 
-from PyQt6.QtCore import QRectF
-from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QPainter
+from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QPainter, QBrush, QPen, QPainterPath
 from olaf_app.visualization_api import PluginParameter
 
 # ---------------------------------------------------------------------------
@@ -79,12 +79,28 @@ def apply_default_text_style_config(config: Dict[str, Any]) -> None:
     """
     # Basic font
     config.setdefault("font_family", "")
-    config.setdefault("font_size", 40)
+
+    # Font sizing strategy:
+    # - New projects store a relative size (fraction of render height) in
+    #   `font_size_rel` (Option A).
+    # - Older projects may only contain a fixed `font_size` (legacy).
+    #
+    # We keep `font_size` for backward compatibility, but the UI is driven by
+    # `font_size_rel` and the host can convert it to a concrete pixel size at
+    # render time.
+    legacy_px = config.get("font_size", None)
+    if "font_size_rel" not in config and isinstance(legacy_px, (int, float)):
+        try:
+            config["font_size_rel"] = float(legacy_px) / 1080.0
+        except Exception:
+            pass
+
+    config.setdefault("font_size_rel", 0.06)  # ~6% of frame height (1080p -> ~65px)
+    config.setdefault("font_size", 40)        # legacy / fallback
     config.setdefault("font_bold", False)
     config.setdefault("font_color", "#ffffff")
     config.setdefault("capitalize_all", False)
-
-    # Outline
+# Outline
     config.setdefault("text_outline_enabled", True)
     config.setdefault("text_outline_color", "#000000")
     config.setdefault("text_outline_width", 2.0)
@@ -162,15 +178,19 @@ def text_style_parameters() -> Dict[str, PluginParameter]:
                 "and any application fonts loaded at startup."
             ),
         ),
-        "font_size": PluginParameter(
-            name="font_size",
-            label="Base font size",
-            type="int",
-            default=40,
-            minimum=16,
-            maximum=200,
-            step=1,
-            description="Base point size used to draw the lyrics text.",
+        "font_size_rel": PluginParameter(
+            name="font_size_rel",
+            label="Font size (relative)",
+            type="float",
+            default=0.06,
+            minimum=0.01,
+            maximum=0.20,
+            step=0.005,
+            description=(
+                "Font size expressed as a fraction of the render height "
+                "(e.g. 0.06 ≈ 6% of the frame height). This makes text scale "
+                "automatically with the output resolution."
+            ),
         ),
         "font_bold": PluginParameter(
             name="font_bold",
@@ -309,13 +329,31 @@ def build_qfont_from_config(
 
     The *painter* is only used to retrieve a sensible default font when
     no family is specified in the config.
+
+    Important:
+        The `point_size` argument is interpreted as a **pixel size**, not a
+        typographic point size.
+
+        Using point sizes makes the final pixel height depend on the device DPI
+        (e.g. screen widgets vs offscreen QImage). Since Olaf stores / computes
+        font sizing in pixels (via `font_size_rel * render_height`), we must
+        use `QFont.setPixelSize(...)` for consistent results between preview and
+        export.
     """
+    # Defensive clamp: Qt behaves poorly with <= 0 sizes.
+    px = int(point_size)
+    if px <= 0:
+        px = 1
+
     family = str(config.get("font_family") or "").strip()
     if family:
-        font = QFont(family, point_size)
+        font = QFont(family)
+        font.setPixelSize(px)
     else:
-        font = painter.font()
-        font.setPointSize(point_size)
+        # Start from the painter's current font to inherit platform defaults,
+        # but enforce an explicit pixel size.
+        font = QFont(painter.font())
+        font.setPixelSize(px)
 
     if bool(config.get("font_bold", False)):
         font.setBold(True)
@@ -345,40 +383,66 @@ def _apply_outline_and_shadow(
     text: str,
     config: Dict[str, Any],
     base_color: QColor,
+    global_opacity: float = 1.0,
 ) -> None:
     """
-    Internal helper: draw shadow + outline for the given text.
+    Internal helper: draw shadow + outline + fill for the given text.
 
-    This expects the painter to already be configured with the desired font.
+    We apply the caller's opacity *to the colors* and draw with painter opacity
+    forced to 1.0. This guarantees that per-word fading impacts fill, outline
+    and shadow consistently, and avoids outline overdraw becoming visually
+    too opaque compared to the fill.
     """
-    # Shadow
+    try:
+        global_opacity_f = float(global_opacity)
+    except Exception:
+        global_opacity_f = 1.0
+    global_opacity_f = max(0.0, min(1.0, global_opacity_f))
+
+    def _scale_alpha(c: QColor) -> QColor:
+        cc = QColor(c)
+        cc.setAlphaF(max(0.0, min(1.0, cc.alphaF() * global_opacity_f)))
+        return cc
+
+    # Build a vector path for the glyphs: one stroke, one fill (better alpha behavior).
+    path = QPainterPath()
+    path.addText(float(x), float(y), painter.font(), text)
+
+    # Shadow (filled path).
     if bool(config.get("text_shadow_enabled", False)):
         shadow_color = QColor(str(config.get("text_shadow_color") or "#000000"))
-        if not shadow_color.isValid():
-            shadow_color = QColor("#000000")
-        dx = int(config.get("text_shadow_offset_x", 3))
-        dy = int(config.get("text_shadow_offset_y", 3))
-        painter.setPen(shadow_color)
-        painter.drawText(int(x + dx), int(y + dy), text)
+        shadow_color = _scale_alpha(shadow_color)
+        try:
+            shadow_dx = float(config.get("text_shadow_dx", 2.0))
+            shadow_dy = float(config.get("text_shadow_dy", 2.0))
+        except Exception:
+            shadow_dx, shadow_dy = 2.0, 2.0
 
-    # Outline
+        if shadow_color.alpha() > 0:
+            painter.save()
+            painter.translate(shadow_dx, shadow_dy)
+            painter.fillPath(path, QBrush(shadow_color))
+            painter.restore()
+
+    # Outline (single stroked path).
     if bool(config.get("text_outline_enabled", False)):
         outline_color = QColor(str(config.get("text_outline_color") or "#000000"))
-        if not outline_color.isValid():
-            outline_color = QColor("#000000")
-        width = float(config.get("text_outline_width", 2.0))
-        stroke_steps = max(1, int(width))
+        outline_color = _scale_alpha(outline_color)
+        try:
+            width = float(config.get("text_outline_width", 2.0))
+        except Exception:
+            width = 2.0
 
-        painter.setPen(outline_color)
-        for dx in range(-stroke_steps, stroke_steps + 1):
-            for dy in range(-stroke_steps, stroke_steps + 1):
-                if dx == 0 and dy == 0:
-                    continue
-                painter.drawText(int(x + dx), int(y + dy), text)
+        if width > 0.01 and outline_color.alpha() > 0:
+            pen = QPen(outline_color)
+            pen.setWidthF(width)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.strokePath(path, pen)
 
-    # Main text fill
-    painter.setPen(base_color)
-    painter.drawText(int(x), int(y), text)
+    # Main fill.
+    painter.fillPath(path, QBrush(_scale_alpha(base_color)))
+
 
 
 def draw_styled_text(
@@ -405,6 +469,18 @@ def draw_styled_text(
     painter.save()
     painter.setFont(base_font)
 
+    # The caller may set painter opacity for per-word fading.
+    # We capture it once and apply it to colors (fill/outline/shadow/box) to
+    # keep all components fading consistently.
+    try:
+        global_opacity = float(painter.opacity())
+    except Exception:
+        global_opacity = 1.0
+    global_opacity = max(0.0, min(1.0, global_opacity))
+    if global_opacity < 0.999:
+        painter.setOpacity(1.0)
+
+
     fm = QFontMetrics(base_font)
     text_width = fm.horizontalAdvance(text_to_draw)
     text_height = fm.height()
@@ -416,7 +492,7 @@ def draw_styled_text(
             box_color = QColor("#000000")
         alpha = float(config.get("text_box_alpha", 0.55))
         alpha_clamped = max(0.0, min(1.0, alpha))
-        box_color.setAlphaF(alpha_clamped)
+        box_color.setAlphaF(alpha_clamped * global_opacity)
 
         padding_rel = float(config.get("text_box_padding", 0.35))
         pad = max(0.0, padding_rel) * text_height
@@ -436,6 +512,7 @@ def draw_styled_text(
         y=y,
         text=text_to_draw,
         config=config,
+        global_opacity=global_opacity,
         base_color=base_color,
     )
 

@@ -37,8 +37,8 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
         "Shows a single word at the center, scaling with the vocal amplitude "
         "and slightly rotating on each word change."
     )
-    plugin_author: str = "Olaf"
-    plugin_version: str = "0.4.0"
+    plugin_author: str = "DrDLP"
+    plugin_version: str = "0.5.0"
 
     def __init__(
         self,
@@ -57,19 +57,22 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
         self._rng = random.Random()
 
         # Plugin-specific defaults
-        self.config.setdefault("base_font_size", 64)
         self.config.setdefault("amp_scale", 1.0)
         self.config.setdefault("min_scale", 0.8)
         self.config.setdefault("max_scale", 2.0)
-        self.config.setdefault("center_y", 0.55)
         self.config.setdefault("rotation_variation_deg", 6.0)
 
-        # Background configuration (same convention as other lyrics plugins)
-        self.config.setdefault("background_mode", "gradient")  # "gradient", "solid", "cover"
-        self.config.setdefault("background_color", "#000000")
-        self.config.setdefault("background_gradient_top", "#101010")
-        self.config.setdefault("background_gradient_bottom", "#402840")
+        # Shared text positioning (saved per plugin by the host).
+        # Legacy migration: older versions used 'center_y'.
+        self.config.setdefault("text_pos_x", 0.5)
+        if "text_pos_y" not in self.config:
+            legacy_center_y = self.config.get("center_y", None)
+            self.config["text_pos_y"] = 0.55 if legacy_center_y is None else legacy_center_y
+        # Remove legacy key to avoid confusion (kept only in older projects).
+        self.config.pop("center_y", None)
 
+        # Background defaults (the UI forces the project cover in most cases).
+        self.config.setdefault("background_mode", "cover")
         # Reasonable widget size
         self.setMinimumHeight(160)
         self.setSizePolicy(
@@ -83,50 +86,14 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
     @classmethod
     def parameters(cls) -> Dict[str, PluginParameter]:
         """
-        Expose shared text-style parameters + plugin-specific controls.
+        Expose shared text-style parameters + effect controls.
+
+        Text styling (font, outline, shadow, background box) is managed
+        through the shared lyrics_text_style helpers.
         """
-        params = text_style_parameters()
+        params = dict(text_style_parameters())
         params.update(
             {
-                "background_mode": PluginParameter(
-                    name="background_mode",
-                    label="Background mode",
-                    type="enum",
-                    default="gradient",
-                    choices=["gradient", "solid", "cover"],
-                    description="How to fill the background: gradient, solid color, or project cover.",
-                ),
-                "background_color": PluginParameter(
-                    name="background_color",
-                    label="Background color",
-                    type="color",
-                    default="#000000",
-                    description="Background color when mode is 'solid'.",
-                ),
-                "background_gradient_top": PluginParameter(
-                    name="background_gradient_top",
-                    label="Gradient top color",
-                    type="color",
-                    default="#101010",
-                    description="Top color of the vertical gradient background.",
-                ),
-                "background_gradient_bottom": PluginParameter(
-                    name="background_gradient_bottom",
-                    label="Gradient bottom color",
-                    type="color",
-                    default="#402840",
-                    description="Bottom color of the vertical gradient background.",
-                ),
-                "base_font_size": PluginParameter(
-                    name="base_font_size",
-                    label="Base font size",
-                    type="int",
-                    default=64,
-                    minimum=16,
-                    maximum=200,
-                    step=1,
-                    description="Base point size before applying audio scaling.",
-                ),
                 "amp_scale": PluginParameter(
                     name="amp_scale",
                     label="Amplitude scale",
@@ -159,16 +126,6 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
                     maximum=5.0,
                     step=0.1,
                     description="Upper bound on the size multiplier.",
-                ),
-                "center_y": PluginParameter(
-                    name="center_y",
-                    label="Vertical center (rel.)",
-                    type="float",
-                    default=0.55,
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.01,
-                    description="Relative vertical position of the word center.",
                 ),
                 "rotation_variation_deg": PluginParameter(
                     name="rotation_variation_deg",
@@ -289,17 +246,7 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
 
         ctx = self.current_context()
         if ctx is None or not (ctx.text_active_word or "").strip():
-            # Fallback message
-            painter.setPen(QColor(200, 200, 200))
-            font = painter.font()
-            font.setPointSize(18)
-            painter.setFont(font)
-            msg = "Waiting for word."
-            fm = painter.fontMetrics()
-            tw = fm.horizontalAdvance(msg)
-            x = rect.center().x() - tw / 2.0
-            y = rect.center().y()
-            painter.drawText(int(x), int(y), msg)
+            # No active word (silence / gap): draw only the background.
             painter.end()
             return
 
@@ -311,9 +258,9 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
         # Compute scaled font size from amplitude
         # ------------------------------------------------------------------
         try:
-            base_size = int(self.config.get("base_font_size", 64))
+            base_size = int(self.config.get("font_size", 40))
         except Exception:
-            base_size = 64
+            base_size = 40
         base_size = max(8, base_size)
 
         try:
@@ -356,15 +303,22 @@ class BigWordPulseVisualization(BaseLyricsVisualization):
 
         text_width = fm.horizontalAdvance(word_text)
 
-        cx = rect.center().x()
-
+        # Text anchor (shared X/Y params).
+        # Prefer the host helper if available, otherwise fallback to normalized config.
         try:
-            center_y_rel = float(self.config.get("center_y", 0.55))
+            get_anchor = getattr(self, "get_text_anchor", None)
+            if callable(get_anchor):
+                cx, cy = get_anchor(rect)
+            else:
+                tx = float(self.config.get("text_pos_x", 0.5))
+                ty = float(self.config.get("text_pos_y", 0.55))
+                tx = max(0.0, min(1.0, tx))
+                ty = max(0.0, min(1.0, ty))
+                cx = rect.left() + rect.width() * tx
+                cy = rect.top() + rect.height() * ty
         except Exception:
-            center_y_rel = 0.55
-        center_y_rel = max(0.0, min(1.0, center_y_rel))
-
-        cy = rect.height() * center_y_rel
+            cx = rect.center().x()
+            cy = rect.center().y()
 
         # Baseline such that the text is vertically centered around cy
         ascent = fm.ascent()

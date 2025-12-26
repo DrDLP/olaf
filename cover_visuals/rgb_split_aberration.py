@@ -43,7 +43,7 @@ class CoverRGBSplitAberrationEffect(BaseCoverEffect):
         "Audio-reactive RGB channel split: red shifts left, blue shifts right "
         "as amplitude increases, creating a chromatic aberration / glitch look."
     )
-    effect_author: str = "Olaf"
+    effect_author: str = "DrDLP"
     effect_version: str = "0.1.0"
     effect_max_inputs: int = 1
 

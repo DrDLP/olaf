@@ -106,10 +106,23 @@ class LyricsVisualizationsManager:
                 continue
 
             # Do not allow duplicates silently; last one wins.
+            # Merge shared base parameters with plugin-specific ones.
             try:
-                parameters = obj.parameters()
+                base_params = _Base.parameters()
             except Exception:
-                parameters = {}
+                base_params = {}
+
+            try:
+                plugin_params = obj.parameters()
+            except Exception:
+                plugin_params = {}
+
+            parameters = dict(base_params)
+            try:
+                parameters.update(plugin_params or {})
+            except Exception:
+                # Be defensive: never crash plugin discovery on bad metadata.
+                pass
 
             info = LyricsVisualizationInfo(
                 plugin_id=plugin_id,

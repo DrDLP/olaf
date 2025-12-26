@@ -451,7 +451,7 @@ class ParticleCloudVisualization(BaseVisualization):
 
     plugin_id = "dr_dlp_particle_cloud"
     plugin_name = "Particle Cloud"
-    plugin_author = "Dr DLP"
+    plugin_author = "DrDLP"
     plugin_version = "1.0.0"
     plugin_max_inputs = 4
 

@@ -66,6 +66,18 @@ class BaseVisualization(ABC):
         """
         raise NotImplementedError
 
+    def get_background_target(self) -> Optional[Dict[str, Any]]:
+        """Optional hook for shared 3D backgrounds.
+
+        3D visualization plugins can override this to expose their rendering scene
+        (e.g. Vispy canvas/view/scene/camera) so a background plugin can attach visuals.
+
+        Expected keys (best-effort):
+          - "canvas", "view", "scene", "camera"
+        """
+        return None
+
+
     def on_activate(self) -> None:
         """Called when the visualization is activated in the UI."""
         pass

@@ -39,7 +39,7 @@ class CoverGlitchSlicesEffect(BaseCoverEffect):
         "Audio-reactive horizontal/vertical glitch bands, "
         "with random offsets and color shifts."
     )
-    effect_author: str = "Olaf"
+    effect_author: str = "DrDLP"
     effect_version: str = "0.1.0"
     effect_max_inputs: int = 1  # one stem typically drives this effect
 

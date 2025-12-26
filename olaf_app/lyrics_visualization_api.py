@@ -2,6 +2,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+from PyQt6.QtCore import QRect
 from PyQt6.QtWidgets import QWidget
 from .visualization_api import PluginParameter
 
@@ -70,6 +71,37 @@ class BaseLyricsVisualization(QWidget):
         # Last frame context, stored so paintEvent() can access it.
         self._last_ctx: Optional[LyricsFrameContext] = None
 
+
+    # ------------------------------------------------------------------
+    # Shared layout helpers
+    # ------------------------------------------------------------------
+    def get_text_anchor(self, rect: QRect) -> tuple[float, float]:
+        """
+        Return the text anchor point (x, y) in widget coordinates.
+
+        The anchor uses normalized coordinates stored in the config:
+          - text_pos_x in [0, 1] (0=left, 0.5=center, 1=right)
+          - text_pos_y in [0, 1] (0=top,  0.5=center, 1=bottom)
+
+        Lyrics plugins can use this anchor as their "center" reference.
+        """
+        try:
+            x_rel = float(self.config.get("text_pos_x", 0.5))
+        except Exception:
+            x_rel = 0.5
+        try:
+            y_rel = float(self.config.get("text_pos_y", 0.5))
+        except Exception:
+            y_rel = 0.5
+
+        # Clamp defensively
+        x_rel = max(0.0, min(1.0, x_rel))
+        y_rel = max(0.0, min(1.0, y_rel))
+
+        x = float(rect.left()) + x_rel * float(rect.width())
+        y = float(rect.top()) + y_rel * float(rect.height())
+        return x, y
+
     # ------------------------------------------------------------------
     # Parameters metadata
     # ------------------------------------------------------------------
@@ -78,11 +110,35 @@ class BaseLyricsVisualization(QWidget):
         """
         Return the parameter specification for this plugin.
 
-        Subclasses should override and declare every configurable
-        parameter as a PluginParameter. The host will then build
-        the corresponding Qt widgets automatically.
+        Subclasses should override and declare every configurable parameter
+        as a PluginParameter.
+
+        The base class exposes a small set of *shared* parameters that are
+        useful for most lyrics plugins (e.g. moving the text anchor).
+        The host merges these shared parameters with the plugin-specific ones.
         """
-        return {}
+        return {
+            "text_pos_x": PluginParameter(
+                name="text_pos_x",
+                label="Text position X",
+                type="float",
+                default=0.5,
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                description="Horizontal text anchor in normalized coordinates (0=left, 0.5=center, 1=right).",
+            ),
+            "text_pos_y": PluginParameter(
+                name="text_pos_y",
+                label="Text position Y",
+                type="float",
+                default=0.5,
+                minimum=0.0,
+                maximum=1.0,
+                step=0.01,
+                description="Vertical text anchor in normalized coordinates (0=top, 0.5=center, 1=bottom).",
+            ),
+        }
 
     # ------------------------------------------------------------------
     # State (de)serialization

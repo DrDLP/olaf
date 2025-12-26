@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any
 
 import time
 import copy
+import json  # <<< for import/export JSON
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ try:
 except Exception:  # pragma: no cover
     librosa = None  # type: ignore[assignment]
 
-from PyQt6.QtCore import Qt, QTimer, QSettings
+from PyQt6.QtCore import Qt, QTimer, QSettings, QEvent
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtCore import QUrl
@@ -39,12 +40,16 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QCheckBox,
     QSlider,
+    QMenu,           # <<< new
+    QFileDialog,     # <<< new
+    QApplication,    # <<< new (clipboard)
 )
 
 from .project_manager import Project
 from .cover_visualizations_manager import CoverVisualizationsManager, CoverEffectInfo
 from .cover_visualization_api import FrameFeatures
 from .visualization_api import PluginParameter  # noqa: F401 (used for type hints in plugins)
+
 
 @dataclass
 class AudioEnvelope:
@@ -113,7 +118,7 @@ class CoverVisualizationsTab(QWidget):
 
         # When True, UI updates (sliders, audio source) must not trigger saves.
         self._suspend_save: bool = False
-        
+
         # Internal flag to distinguish plugin_combo changes coming from
         # a chain selection (we do NOT clear _current_chain_index then).
         self._plugin_combo_change_from_chain: bool = False
@@ -134,17 +139,16 @@ class CoverVisualizationsTab(QWidget):
         self.chain_audio_source_combo: QComboBox
         self.btn_preview_chain_live: QPushButton
         self.params_form_layout: QFormLayout
+        self.btn_chain_io: QPushButton  # <<< new: button for import/export
 
         self._build_ui()
         # Populate audio source combos (including playback) even without project
         self._refresh_audio_source_combo()
         self._rescan_plugins()
 
-
     # ------------------------------------------------------------------ #
     # UI construction                                                    #
     # ------------------------------------------------------------------ #
-
     def _build_ui(self) -> None:
         """
         Build the UI for 2D cover-based visualizations.
@@ -155,19 +159,12 @@ class CoverVisualizationsTab(QWidget):
           - Right (top to bottom):
               * Effect chain
               * Chain preview (playback source + live preview)
-              * Available 2D effects
               * Effect parameters
-              * Audio routing + single-effect preview
+              * Import/export tools
         """
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
-
-        # Title
-        #title = QLabel("2D visualizations (cover-based)", self)
-        #title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        #title.setStyleSheet("font-size: 16px; font-weight: bold;")
-        #main_layout.addWidget(title)
 
         # Current project label (now hidden: shown globally in bottom bar)
         self.project_label = QLabel("", self)
@@ -189,22 +186,28 @@ class CoverVisualizationsTab(QWidget):
         content_layout.addLayout(left_col, stretch=1)
 
         self.cover_label = QLabel("No cover loaded.", self)
+        # Let the cover preview grow both horizontally AND vertically so the
+        # pixmap scaling is not height-limited (which otherwise makes it look
+        # "small" even when the tab has plenty of available width).
         self.cover_label.setAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
+            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
         )
-        self.cover_label.setMinimumSize(320, 320)
+        self.cover_label.setMinimumWidth(320)
+        self.cover_label.setMinimumHeight(160)
         self.cover_label.setStyleSheet(
             "background-color: #202020; color: #AAAAAA; border: 1px solid #404040;"
         )
+        # Use all available width, but do not expand to the full tab height.
+        # The label height is constrained from the cover aspect ratio in
+        # _sync_cover_label_aspect_ratio().
         self.cover_label.setSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
         )
-        left_col.addWidget(self.cover_label, stretch=1)
-
+        left_col.addWidget(self.cover_label)
 
         # --------------------------------------------------------------
-        # Right: all controls (chain, preview, plugins, params, routing)
+        # Right: all controls (chain, preview, params, IO)
         # --------------------------------------------------------------
         right_col = QVBoxLayout()
         right_col.setContentsMargins(0, 0, 0, 0)
@@ -261,7 +264,34 @@ class CoverVisualizationsTab(QWidget):
 
         right_col.addWidget(chain_preview_group)
 
-        # --- Group: Available effects ---------------------------------
+        # --- Group: Parameters for selected effect --------------------
+        params_group = QGroupBox("Effect parameters", self)
+        self.params_form_layout = QFormLayout(params_group)
+        self.params_form_layout.setFieldGrowthPolicy(
+            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
+        )
+        right_col.addWidget(params_group)
+
+        # --- Row: Import / export tools (bottom-right) ----------------
+        io_row = QHBoxLayout()
+        io_row.addStretch(1)
+
+        # Reset parameters + routing of the currently selected chain instance
+        # to the plugin's declared default values.
+        self.btn_reset_defaults = QPushButton("Reset to defaults", self)
+        self.btn_reset_defaults.setToolTip(
+            "Reset the current effect parameters and routing to plugin defaults (template or chain instance)."
+        )
+        self.btn_reset_defaults.clicked.connect(self._on_reset_to_defaults_clicked)
+        io_row.addWidget(self.btn_reset_defaults)
+
+        self.btn_chain_io = QPushButton("Import / export chain…", self)
+        self.btn_chain_io.clicked.connect(self._on_chain_io_clicked)
+        io_row.addWidget(self.btn_chain_io)
+
+        right_col.addLayout(io_row)
+
+        # --- Left: available effects + routing ------------------------
         plugins_group = QGroupBox("Available 2D effects", self)
         plugins_layout = QFormLayout(plugins_group)
 
@@ -286,14 +316,6 @@ class CoverVisualizationsTab(QWidget):
 
         left_col.addWidget(plugins_group)
 
-        # --- Group: Parameters for selected effect --------------------
-        params_group = QGroupBox("Effect parameters", self)
-        self.params_form_layout = QFormLayout(params_group)
-        self.params_form_layout.setFieldGrowthPolicy(
-            QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow
-        )
-        right_col.addWidget(params_group)
-
         # --- Group: Audio routing + per-effect preview ----------------
         routing_group = QGroupBox("Audio routing & single-effect preview", self)
         routing_layout = QFormLayout(routing_group)
@@ -310,24 +332,478 @@ class CoverVisualizationsTab(QWidget):
 
         left_col.addWidget(routing_group)
 
-        # Push everything up
+        # Pousse l'espace libre tout en bas de la colonne gauche
+        left_col.addStretch(1)
         right_col.addStretch(1)
-
 
     def resizeEvent(self, event) -> None:
         """
-        Ensure the cover preview always uses the full available width.
+        Keep the cover preview scaled to the available label size.
 
-        Each time the tab is resized (including when it is first shown),
-        we rescale the current pixmap to the new label size so that the
-        image behaves like after a manual preview.
+        Important: we rescale from ``_display_pixmap_source`` (the last unscaled
+        pixmap we received) to avoid repeated down/up-scaling quality loss.
         """
         super().resizeEvent(event)
+        self._sync_cover_label_aspect_ratio()
+        source = getattr(self, "_display_pixmap_source", None)
+        if isinstance(source, QPixmap) and not source.isNull():
+            self._set_pixmap_scaled(source)
+
+    def showEvent(self, event) -> None:
+        """
+        When the tab becomes visible, the label size may change after layout.
+
+        A zero-delay singleShot ensures we rescale once the layout is settled,
+        so the preview fills the available width immediately.
+        """
+        super().showEvent(event)
+        self._sync_cover_label_aspect_ratio()
+        # The layout may still be settling when the tab is shown.
+        # A second delayed rescale fixes the common "small preview" case.
+        QTimer.singleShot(0, self._ensure_preview_scaled)
+        QTimer.singleShot(50, self._ensure_preview_scaled)
+
+    def _ensure_preview_scaled(self) -> None:
+        """Ensure the current displayed pixmap is scaled to the current label size."""
+        source = getattr(self, "_display_pixmap_source", None)
+        if isinstance(source, QPixmap) and not source.isNull():
+            self._set_pixmap_scaled(source)
+            return
         pix = self.cover_label.pixmap()
         if pix is not None and not pix.isNull():
-            # Rescale the current image (original cover or preview frame)
             self._set_pixmap_scaled(pix)
 
+
+    def _sync_cover_label_aspect_ratio(self) -> None:
+        """
+        Constrain the cover preview label height to match the cover aspect ratio.
+
+        Goal:
+          - Use 100% of the available width
+          - Use the *maximum* height implied by that width while preserving proportions
+          - Avoid the label expanding to the full tab height (which looks like a
+            huge empty area around the pixmap).
+
+        We do this by dynamically setting a maximumHeight based on:
+          label_width * (pixmap_height / pixmap_width)
+        """
+        if not hasattr(self, "cover_label"):
+            return
+
+        # Prefer the unscaled source pixmap if available.
+        src_pix = getattr(self, "_display_pixmap_source", None)
+        if not isinstance(src_pix, QPixmap) or src_pix.isNull():
+            src_pix = self.cover_label.pixmap()
+
+        if not isinstance(src_pix, QPixmap) or src_pix.isNull():
+            aspect = 1.0
+        else:
+            w = max(1, int(src_pix.width()))
+            h = max(1, int(src_pix.height()))
+            aspect = float(h) / float(w)
+
+        label_w = self.cover_label.width()
+        if label_w <= 0:
+            label_w = self.cover_label.minimumWidth()
+        label_w = max(1, int(label_w))
+
+        desired_h = max(160, int(label_w * aspect))
+        self.cover_label.setMaximumHeight(desired_h)
+
+
+    def _stop_all_previews(self, restore_cover: bool = True) -> None:
+        """
+        Stop any running single-effect or full-chain live previews.
+
+        This prevents preview timers from reusing stale cached frames when the
+        user switches projects, and avoids audio continuing unexpectedly.
+        """
+        # Stop single-effect preview
+        preview_timer = getattr(self, "_preview_timer", None)
+        if preview_timer is not None:
+            preview_timer.stop()
+        preview_player = getattr(self, "_preview_player", None)
+        if isinstance(preview_player, QMediaPlayer):
+            preview_player.stop()
+
+        # Stop chain preview
+        chain_timer = getattr(self, "_chain_preview_timer", None)
+        if chain_timer is not None:
+            chain_timer.stop()
+        chain_player = getattr(self, "_chain_preview_player", None)
+        if isinstance(chain_player, QMediaPlayer):
+            chain_player.stop()
+
+        # Clear runtime preview state
+        self._preview_effect = None
+        self._preview_envelope = None
+        self._chain_preview_effects = None
+        self._chain_preview_envelopes = None
+        self._chain_preview_sources = None
+
+        # Base frame cache must be reset when changing projects/covers
+        self._preview_base_frame = None
+
+        if restore_cover:
+            self._refresh_cover_view()
+            # Rescale once layout is stable
+            QTimer.singleShot(0, self._ensure_preview_scaled)
+
+    def _get_param_default_value(self, param: Any) -> Any:
+        """Return a robust default value for a plugin parameter metadata object."""
+        if param is None:
+            return None
+
+        default = getattr(param, "default", None)
+        if default is not None:
+            return default
+
+        ptype = getattr(param, "type", "float") or "float"
+        if ptype == "bool":
+            return False
+        if ptype == "enum":
+            choices = getattr(param, "choices", None) or []
+            return choices[0] if choices else None
+
+        # Numeric fallbacks
+        if ptype == "int":
+            return int(getattr(param, "minimum", getattr(param, "min", 0)) or 0)
+        return float(getattr(param, "minimum", getattr(param, "min", 0.0)) or 0.0)
+
+
+    def _safe_float(self, value: Any, fallback: float) -> float:
+        """Convert *value* to float, returning *fallback* on None/invalid."""
+        if value is None:
+            return float(fallback)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    def _safe_int(self, value: Any, fallback: int) -> int:
+        """Convert *value* to int, returning *fallback* on None/invalid."""
+        if value is None:
+            return int(fallback)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(fallback)
+
+
+    def _on_reset_to_defaults_clicked(self) -> None:
+        """
+        Reset the current UI controls to the plugin defaults.
+
+        This works in two modes:
+          - Template mode: only the widgets are reset (not persisted).
+          - Instance mode: if a matching chain entry is selected, the reset is
+            also saved into the project configuration for that instance.
+        """
+        effect_id = self._current_effect_id()
+        if not effect_id:
+            return
+
+        info = self._plugins_by_id.get(effect_id)
+        if info is None:
+            return
+
+        # Stop previews so we don't keep rendering stale frames while resetting
+        self._stop_all_previews(restore_cover=False)
+
+        self._suspend_save = True
+        try:
+            # Reset all parameter widgets
+            for name, param in (info.parameters or {}).items():
+                widget = self._param_widgets.get(name)
+                if widget is None:
+                    continue
+                default_value = self._get_param_default_value(param)
+                self._set_widget_value(widget, default_value)
+
+            # Reset routing (audio source) to 'main'
+            self._refresh_audio_source_combo()
+            self._set_audio_source_in_combo("main")
+        finally:
+            self._suspend_save = False
+
+        # Persist only if we are editing a concrete chain instance that matches
+        # the current plugin selection.
+        if (
+            self._current_chain_index is not None
+            and 0 <= self._current_chain_index < len(self._effect_chain)
+        ):
+            instance_key = self._effect_chain[self._current_chain_index]
+            base_id, _ = self._split_chain_entry(instance_key)
+            if base_id == effect_id:
+                self._save_current_effect_config()
+
+        # Restore cover preview for the current project and scale it
+        self._refresh_cover_view()
+        QTimer.singleShot(0, self._ensure_preview_scaled)
+    def _on_chain_io_clicked(self) -> None:
+        """
+        Show a small context menu for chain import/export and human summary.
+
+        Single button -> 3 actions:
+          - Export chain to JSON
+          - Import chain from JSON
+          - Copy human-readable summary to clipboard
+        """
+        menu = QMenu(self)
+        act_export = menu.addAction("Export chain to JSON…")
+        act_import = menu.addAction("Import chain from JSON…")
+        act_copy   = menu.addAction("Copy human-readable summary")
+
+        # Position the menu just under the button (bottom-right)
+        pos = self.btn_chain_io.mapToGlobal(self.btn_chain_io.rect().bottomRight())
+        chosen = menu.exec(pos)
+        if chosen is None:
+            return
+
+        if chosen is act_export:
+            self._export_chain_to_json()
+        elif chosen is act_import:
+            self._import_chain_from_json()
+        elif chosen is act_copy:
+            self._copy_chain_human_summary()
+
+    def _export_chain_to_json(self) -> None:
+        """
+        Export current effect chain + configurations to a JSON file.
+
+        The JSON structure is:
+          {
+            "version": 1,
+            "project_name": "...",
+            "effect_chain": [...],
+            "effect_configs": {...}
+          }
+        """
+        if not self._effect_chain:
+            QMessageBox.information(
+                self,
+                "Empty chain",
+                "The effect chain is empty. Nothing to export.",
+            )
+            return
+
+        base_dir = str(self._project.folder) if self._project is not None else ""
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export chain to JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        data = {
+            "version": 1,
+            "project_name": getattr(self._project, "name", None),
+            "effect_chain": list(self._effect_chain),
+            "effect_configs": dict(self._effect_configs),
+        }
+
+        try:
+            with open(file_name, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Export error",
+                f"Could not write JSON file:\n{exc}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Export completed",
+            f"Effect chain exported to:\n{file_name}",
+        )
+
+    def _import_chain_from_json(self) -> None:
+        """
+        Import an effect chain + configurations from a JSON file.
+
+        Existing in-memory chain/configs are replaced. Then:
+          - chain is sanitized against available plugins
+          - UI is rebuilt
+          - project is saved
+        """
+        base_dir = str(self._project.folder) if self._project is not None else ""
+        file_name, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import chain from JSON",
+            base_dir,
+            "JSON files (*.json);;All files (*)",
+        )
+        if not file_name:
+            return
+
+        try:
+            with open(file_name, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Import error",
+                f"Could not read JSON file:\n{exc}",
+            )
+            return
+
+        if not isinstance(data, dict):
+            QMessageBox.warning(
+                self,
+                "Invalid file",
+                "The selected file does not contain a valid chain description.",
+            )
+            return
+
+        effect_chain = data.get("effect_chain")
+        effect_configs = data.get("effect_configs")
+
+        if not isinstance(effect_chain, list) or not isinstance(effect_configs, dict):
+            QMessageBox.warning(
+                self,
+                "Invalid format",
+                "The JSON file is missing 'effect_chain' or 'effect_configs'.",
+            )
+            return
+
+        # Replace current state
+        self._effect_chain = list(effect_chain)
+        self._effect_configs = dict(effect_configs)
+
+        # Post-process: sanitize vs available plugins, migrate legacy keys,
+        # rebuild UI and persist to project.
+        self._migrate_legacy_instance_keys()
+        self._sanitize_chain_against_plugins()
+        self._rebuild_chain_list()
+        self._current_chain_index = None
+        self._current_instance_key = None
+        self._reload_current_plugin_ui()
+        self._save_to_project()
+
+        QMessageBox.information(
+            self,
+            "Import completed",
+            "Effect chain successfully imported from JSON.",
+        )
+
+    def _copy_chain_human_summary(self) -> None:
+        """
+        Build a human-readable summary of the current effect chain and
+        copy it to the system clipboard.
+
+        This is intended to be pasted into e.g. a YouTube description.
+        """
+        if not self._effect_chain:
+            QMessageBox.information(
+                self,
+                "Empty chain",
+                "The effect chain is empty. Nothing to describe.",
+            )
+            return
+
+        text = self._build_human_chain_summary()
+        if not text:
+            QMessageBox.warning(
+                self,
+                "Summary error",
+                "Could not build a human-readable summary for the current chain.",
+            )
+            return
+
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+
+        QMessageBox.information(
+            self,
+            "Summary copied",
+            "A human-readable description of the effect chain has been "
+            "copied to the clipboard.",
+        )
+
+    def _build_human_chain_summary(self) -> str:
+        """
+        Build a readable multi-line text describing effect order,
+        plugin names and parameter values.
+
+        Example:
+
+          Cover visual effect chain
+          Project: My Song
+
+          1. Glitch (1)
+             - Intensity: 0.75
+             - Speed: 1.20
+             Audio source: main
+
+          2. Vignette
+             - Radius: 0.8
+             Audio source: stem:vocals
+        """
+        lines: List[str] = []
+        lines.append("Cover visual effect chain")
+        if self._project is not None:
+            lines.append(f"Project: {self._project.name}")
+        lines.append("")
+
+        # First pass: count instances per effect_id (for suffix like (1), (2)...)
+        counts: Dict[str, int] = {}
+        for entry in self._effect_chain:
+            eff_id, _ = self._split_chain_entry(entry)
+            counts[eff_id] = counts.get(eff_id, 0) + 1
+
+        # Second pass: produce lines
+        seen: Dict[str, int] = {}
+        for position, entry in enumerate(self._effect_chain, start=1):
+            eff_id, explicit_idx = self._split_chain_entry(entry)
+            info = self._plugins_by_id.get(eff_id)
+            base_name = info.name if info is not None else eff_id
+
+            seen[eff_id] = seen.get(eff_id, 0) + 1
+            idx = explicit_idx or seen[eff_id]
+
+            if counts.get(eff_id, 0) > 1:
+                display_name = f"{base_name} ({idx})"
+            else:
+                display_name = base_name
+
+            lines.append(f"{position}. {display_name}")
+
+            cfg = self._effect_configs.get(entry)
+            if cfg is None:
+                # Fallback to legacy per-effect config if present
+                cfg = self._effect_configs.get(eff_id, {})
+
+            params = {}
+            routing = {}
+            if isinstance(cfg, dict):
+                params = cfg.get("parameters", {}) or {}
+                routing = cfg.get("routing", {}) or {}
+
+            # Try to use parameter labels from plugin metadata
+            param_meta = info.parameters if (info is not None and info.parameters) else {}
+
+            # Sort parameters by label name for stable output
+            for param_name, value in sorted(params.items(), key=lambda kv: kv[0]):
+                meta = param_meta.get(param_name) if isinstance(param_meta, dict) else None
+                label = getattr(meta, "label", None) or param_name
+
+                # Simple formatting for floats
+                if isinstance(value, float):
+                    display_val = f"{value:.4g}"
+                else:
+                    display_val = str(value)
+
+                lines.append(f"   - {label}: {display_val}")
+
+            audio_source = routing.get("audio_source", "main")
+            lines.append(f"   Audio source: {audio_source}")
+            lines.append("")
+
+        return "\n".join(lines).strip()
 
     # ------------------------------------------------------------------ #
     # Plugin discovery                                                   #
@@ -388,14 +864,13 @@ class CoverVisualizationsTab(QWidget):
             return entry, None
         return base, idx
 
-
     def _sanitize_chain_against_plugins(self) -> None:
         """
         Remove any chain entry whose underlying effect_id is no longer
         available in the discovered plugin list.
 
         Also keeps _effect_configs consistent for new-format instance keys.
-        Old per-effect configs are kept as a fallback for legacy projects.
+        Old projects may still use effect_id as keys. We handle both.
         """
         valid_ids = set(self._plugins_by_id.keys())
         new_chain: List[str] = []
@@ -423,11 +898,9 @@ class CoverVisualizationsTab(QWidget):
 
         self._effect_configs = new_configs
 
-
     # ------------------------------------------------------------------ #
     # Plugin selection & parameter UI                                    #
     # ------------------------------------------------------------------ #
-
     def _on_plugin_combo_changed(self, index: int) -> None:
         """
         React to plugin combo changes.
@@ -467,6 +940,9 @@ class CoverVisualizationsTab(QWidget):
         self._current_instance_key = None
 
         effect_id = self._current_effect_id()
+        if hasattr(self, "btn_reset_defaults"):
+            self.btn_reset_defaults.setEnabled(bool(effect_id))
+
         if not effect_id:
             self.plugin_details_label.setText(
                 "No effect selected. Choose an effect script from the combo box."
@@ -482,6 +958,8 @@ class CoverVisualizationsTab(QWidget):
 
         info = self._plugins_by_id.get(effect_id)
         if info is None:
+            if hasattr(self, "btn_reset_defaults"):
+                self.btn_reset_defaults.setEnabled(False)
             self.plugin_details_label.setText(
                 "Selected effect is not available in the plugin list."
             )
@@ -541,9 +1019,31 @@ class CoverVisualizationsTab(QWidget):
                 row = QHBoxLayout(container)
                 row.setContentsMargins(0, 0, 0, 0)
 
-                p_min = int(getattr(param, "minimum", getattr(param, "min", 0)))
-                p_max = int(getattr(param, "maximum", getattr(param, "max", 100)))
-                step = int(getattr(param, "step", 1)) or 1
+                p_def = self._get_param_default_value(param)
+
+                min_raw = getattr(param, "minimum", None)
+                if min_raw is None:
+                    min_raw = getattr(param, "min", None)
+
+                max_raw = getattr(param, "maximum", None)
+                if max_raw is None:
+                    max_raw = getattr(param, "max", None)
+
+                if min_raw is None and max_raw is None and isinstance(p_def, (int, float)):
+                    center = int(round(p_def))
+                    span = max(10, abs(center))
+                    p_min = center - span
+                    p_max = center + span
+                else:
+                    p_min = self._safe_int(min_raw, 0)
+                    p_max = self._safe_int(max_raw, p_min + 100)
+
+                if p_max < p_min:
+                    p_min, p_max = p_max, p_min
+                if p_max == p_min:
+                    p_max = p_min + 1
+
+                step = self._safe_int(getattr(param, "step", None), 1) or 1
 
                 sb = QSpinBox(container)
                 sb.setMinimum(p_min)
@@ -580,12 +1080,31 @@ class CoverVisualizationsTab(QWidget):
                 row = QHBoxLayout(container)
                 row.setContentsMargins(0, 0, 0, 0)
 
-                p_min = float(getattr(param, "minimum", getattr(param, "min", 0.0)))
-                p_max = float(getattr(param, "maximum", getattr(param, "max", 1.0)))
-                step = float(getattr(param, "step", 0.01)) or 0.01
+                p_def = self._get_param_default_value(param)
+
+                min_raw = getattr(param, "minimum", None)
+                if min_raw is None:
+                    min_raw = getattr(param, "min", None)
+
+                max_raw = getattr(param, "maximum", None)
+                if max_raw is None:
+                    max_raw = getattr(param, "max", None)
+
+                if min_raw is None and max_raw is None and isinstance(p_def, (int, float)):
+                    center = float(p_def)
+                    span = max(1.0, abs(center))
+                    p_min = center - span
+                    p_max = center + span
+                else:
+                    p_min = self._safe_float(min_raw, 0.0)
+                    p_max = self._safe_float(max_raw, p_min + 1.0)
 
                 if p_max < p_min:
                     p_min, p_max = p_max, p_min
+                if p_max == p_min:
+                    p_max = p_min + 1.0
+
+                step = self._safe_float(getattr(param, "step", None), 0.01) or 0.01
 
                 dsb = QDoubleSpinBox(container)
                 dsb.setDecimals(4)
@@ -655,11 +1174,15 @@ class CoverVisualizationsTab(QWidget):
         # ------------------------------------------------------------------
         self._suspend_save = True
         try:
-            # 1) Sliders / widgets
-            for name, value in saved_params.items():
+            # 1) Parameter widgets
+            for name, param in (params.items() if isinstance(params, dict) else []):
                 w = self._param_widgets.get(name)
                 if w is None:
                     continue
+
+                # If no saved state exists (template UI), fall back to the
+                # declared parameter default.
+                value = saved_params.get(name, self._get_param_default_value(param))
                 self._set_widget_value(w, value)
 
             # 2) Routing combo (audio_source_combo)
@@ -962,6 +1485,7 @@ class CoverVisualizationsTab(QWidget):
         if getattr(self, "_suspend_save", False):
             return
         self._save_current_effect_config()
+        self._schedule_preview_refresh(reason="audio_source")
 
     # ------------------------------------------------------------------ #
     # Parameter handling                                                 #
@@ -972,7 +1496,307 @@ class CoverVisualizationsTab(QWidget):
         if getattr(self, "_suspend_save", False):
             return
         self._save_current_effect_config()
+        self._schedule_preview_refresh(reason="params")
 
+
+
+    # ------------------------------------------------------------------ #
+    # Live preview refresh (debounced)                                    #
+    # ------------------------------------------------------------------ #
+
+    def _schedule_preview_refresh(self, reason: str = "params") -> None:
+        """
+        Debounced refresh when parameters/routing change.
+
+        - If a live preview is running, we re-instantiate the effect(s) so the
+          next tick reflects the new configuration.
+        - If no live preview is running, we render a single static frame so the
+          user sees the impact immediately while tweaking controls.
+        """
+        self._pending_preview_refresh_reason = str(reason or "params")
+
+        timer = getattr(self, "_preview_refresh_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._apply_scheduled_preview_refresh)
+            self._preview_refresh_timer = timer
+
+        # Restart debounce window
+        timer.start(60)
+
+    def _apply_scheduled_preview_refresh(self) -> None:
+        """Apply the scheduled preview refresh."""
+        reason = getattr(self, "_pending_preview_refresh_reason", "params")
+
+        # If single-effect live preview is running, refresh its effect instance.
+        preview_timer = getattr(self, "_preview_timer", None)
+        if preview_timer is not None and preview_timer.isActive():
+            if reason == "audio_source":
+                # Audio source impacts both envelope and playback file: restart.
+                self._restart_single_effect_live_preview()
+            else:
+                self._refresh_single_effect_live_instance()
+            # Render immediately with the new instance.
+            try:
+                self._on_preview_tick()
+            except Exception:
+                pass
+            return
+
+        # If chain live preview is running, refresh its chain instances.
+        chain_timer = getattr(self, "_chain_preview_timer", None)
+        if chain_timer is not None and chain_timer.isActive():
+            self._refresh_chain_live_instances()
+            try:
+                self._on_chain_preview_tick()
+            except Exception:
+                pass
+            return
+
+        # No live preview: render a static preview so tweaks are visible.
+        if self._current_chain_index is not None and self._effect_chain:
+            self._render_static_chain_preview()
+        else:
+            self._render_static_single_effect_preview()
+
+        # Ensure the scaled pixmap matches the current label size.
+        QTimer.singleShot(0, self._ensure_preview_scaled)
+
+    def _restart_single_effect_live_preview(self) -> None:
+        """Restart the single-effect live preview using current UI values."""
+        # Stop current preview but keep the last displayed pixmap as base.
+        timer = getattr(self, "_preview_timer", None)
+        if timer is not None:
+            timer.stop()
+
+        player = getattr(self, "_preview_player", None)
+        if isinstance(player, QMediaPlayer):
+            player.stop()
+
+        # Restart using the existing entry-point (includes audio + envelope).
+        # This may show standard warnings if audio is missing; that is fine.
+        try:
+            self._on_preview_single_effect()
+        except Exception:
+            # Never crash the tab because of preview restart.
+            pass
+
+    def _refresh_single_effect_live_instance(self) -> None:
+        """
+        Recreate the current single-effect instance from the UI parameters.
+
+        This updates the running live preview without restarting audio playback.
+        """
+        effect_id = self._current_effect_id()
+        if not effect_id:
+            return
+
+        env = getattr(self, "_preview_envelope", None)
+        fps = int(getattr(self, "_preview_fps", 25) or 25)
+        if env is None:
+            return
+
+        params: Dict[str, Any] = {}
+        for name, widget in self._param_widgets.items():
+            params[name] = self._get_widget_value(widget)
+
+        try:
+            effect = self._manager.create_instance(effect_id, config=params)
+        except Exception:
+            return
+
+        if effect is None:
+            return
+
+        try:
+            effect.on_sequence_start(duration=float(env.duration), fps=fps)
+        except Exception:
+            pass
+
+        self._preview_effect = effect
+
+    def _refresh_chain_live_instances(self) -> None:
+        """
+        Recreate all chain instances from stored configs.
+
+        This makes parameter/routing tweaks visible in the running chain preview
+        without restarting the playback audio.
+        """
+        playback_env = getattr(self, "_chain_preview_playback_env", None)
+        fps = int(getattr(self, "_chain_preview_fps", 25) or 25)
+        duration = float(getattr(playback_env, "duration", 0.0) or 0.0)
+
+        if not self._effect_chain:
+            return
+
+        chain_instances: List[Any] = []
+        chain_sources: List[str] = []
+        routed_source_ids: set[str] = set()
+
+        for entry in self._effect_chain:
+            effect_id, _ = self._split_chain_entry(entry)
+            if effect_id not in self._plugins_by_id:
+                continue
+
+            config_entry = self._effect_configs.get(entry)
+            if config_entry is None:
+                config_entry = self._effect_configs.get(effect_id, {})
+
+            base_params = (
+                config_entry.get("parameters", {})
+                if isinstance(config_entry, dict)
+                else {}
+            )
+            params = dict(base_params)
+
+            routing = (
+                config_entry.get("routing", {})
+                if isinstance(config_entry, dict)
+                else {}
+            )
+            source_id = routing.get("audio_source", "main") or "main"
+
+            try:
+                inst = self._manager.create_instance(effect_id, config=params)
+            except Exception:
+                continue
+
+            if inst is None:
+                continue
+
+            try:
+                inst.on_sequence_start(duration=duration, fps=fps)
+            except Exception:
+                pass
+
+            chain_instances.append(inst)
+            chain_sources.append(source_id)
+            routed_source_ids.add(source_id)
+
+        if not chain_instances:
+            return
+
+        # Ensure envelopes exist for any new routed sources.
+        env_map = getattr(self, "_chain_preview_envelopes", None)
+        if not isinstance(env_map, dict):
+            env_map = {}
+
+        for source_id in routed_source_ids:
+            if source_id in env_map:
+                continue
+            audio_path = self._resolve_audio_path_for_source(source_id)
+            if audio_path is None or not audio_path.exists():
+                env_map[source_id] = None
+                continue
+            try:
+                env_map[source_id] = self._ensure_audio_envelope(audio_path, fps=fps)
+            except Exception:
+                env_map[source_id] = None
+
+        self._chain_preview_effects = chain_instances
+        self._chain_preview_sources = chain_sources
+        self._chain_preview_envelopes = env_map
+
+    def _render_static_single_effect_preview(self) -> None:
+        """Render one frame of the currently selected effect using UI parameters."""
+        if self._project is None:
+            return
+
+        effect_id = self._current_effect_id()
+        if not effect_id:
+            return
+
+        base_frame = self._ensure_base_frame()
+        if base_frame is None:
+            return
+
+        params: Dict[str, Any] = {}
+        for name, widget in self._param_widgets.items():
+            params[name] = self._get_widget_value(widget)
+
+        try:
+            effect = self._manager.create_instance(effect_id, config=params)
+        except Exception:
+            return
+
+        if effect is None:
+            return
+
+        try:
+            effect.on_sequence_start(duration=1.0, fps=1)
+        except Exception:
+            pass
+
+        try:
+            frame = effect.apply_to_frame(
+                base_frame.copy(),
+                t=0.0,
+                features=FrameFeatures(amp=1.0),
+            )
+        except Exception:
+            return
+
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+            return
+
+        pixmap = self._array_to_pixmap(np.clip(frame, 0, 255).astype(np.uint8))
+        self._set_pixmap_scaled(pixmap)
+
+    def _render_static_chain_preview(self) -> None:
+        """Render one frame of the full chain (amp=1.0) using stored configs."""
+        if self._project is None or not self._effect_chain:
+            return
+
+        base_img = self._load_cover_as_array()
+        if base_img is None:
+            return
+
+        img = base_img
+        features = FrameFeatures(amp=1.0)
+
+        for entry in self._effect_chain:
+            effect_id, _ = self._split_chain_entry(entry)
+            if effect_id not in self._plugins_by_id:
+                continue
+
+            cfg_entry = self._effect_configs.get(entry)
+            if cfg_entry is None:
+                cfg_entry = self._effect_configs.get(effect_id, {})
+
+            base_params = (
+                cfg_entry.get("parameters", {})
+                if isinstance(cfg_entry, dict)
+                else {}
+            )
+            params = dict(base_params)
+
+            effect_instance = None
+            try:
+                effect_instance = self._manager.create_instance(effect_id, config=params)
+            except Exception:
+                effect_instance = None
+
+            if effect_instance is None:
+                continue
+
+            try:
+                effect_instance.on_sequence_start(duration=1.0, fps=1)
+            except Exception:
+                pass
+
+            try:
+                img = effect_instance.apply_to_frame(img, t=0.0, features=features)
+            except Exception:
+                # Skip on error, keep last valid frame
+                continue
+
+            if not isinstance(img, np.ndarray) or img.ndim != 3 or img.shape[2] != 3:
+                img = base_img
+                break
+
+        pixmap = self._array_to_pixmap(np.clip(img, 0, 255).astype(np.uint8))
+        self._set_pixmap_scaled(pixmap)
     def _save_current_effect_config(self) -> None:
         """
         Persist the currently edited instance's parameters + routing into the
@@ -1030,9 +1854,21 @@ class CoverVisualizationsTab(QWidget):
         if isinstance(widget, QCheckBox):
             widget.setChecked(bool(value))
         elif isinstance(widget, QSpinBox):
-            widget.setValue(int(value))
+            if value is None:
+                widget.setValue(widget.minimum())
+            else:
+                try:
+                    widget.setValue(int(value))
+                except (TypeError, ValueError):
+                    widget.setValue(widget.minimum())
         elif isinstance(widget, QDoubleSpinBox):
-            widget.setValue(float(value))
+            if value is None:
+                widget.setValue(widget.minimum())
+            else:
+                try:
+                    widget.setValue(float(value))
+                except (TypeError, ValueError):
+                    widget.setValue(widget.minimum())
         elif isinstance(widget, QComboBox):
             # Try to match by data first, then text
             idx = -1
@@ -1111,7 +1947,24 @@ class CoverVisualizationsTab(QWidget):
     def set_project(self, project: Optional[Project]) -> None:
         """
         Called by MainWindow when the selected project changes.
+
+        Notes
+        -----
+        We explicitly stop any running previews and clear cached frames/envelopes
+        so that switching projects always shows the new cover and uses the new
+        project's audio/stems.
         """
+        # Stop running previews to avoid stale frames/audio when switching projects.
+        self._stop_all_previews(restore_cover=False)
+
+        # Clear per-project caches
+        try:
+            self._audio_cache.clear()
+        except Exception:
+            pass
+        self._preview_base_frame = None
+        self._display_pixmap_source = None
+
         self._project = project
         self._current_chain_index = None
         self._current_instance_key = None
@@ -1123,18 +1976,14 @@ class CoverVisualizationsTab(QWidget):
             self._refresh_cover_view()
             self._rebuild_chain_list()
             self._reload_current_plugin_ui()
+            QTimer.singleShot(0, self._ensure_preview_scaled)
             return
-
 
         self.project_label.setText(f"Current project: {project.name}")
 
-        # Load 2D visual state from project 
-        self._effect_configs = dict(
-            getattr(project, "cover_visual_effects", {}) or {}
-        )
-        self._effect_chain = list(
-            getattr(project, "cover_visual_chain", []) or []
-        )
+        # Load 2D visual state from project
+        self._effect_configs = dict(getattr(project, "cover_visual_effects", {}) or {})
+        self._effect_chain = list(getattr(project, "cover_visual_chain", []) or [])
 
         # Upgrade old projects where the same effect_id appears multiple times
         # without per-instance keys; this will turn duplicates into
@@ -1146,7 +1995,8 @@ class CoverVisualizationsTab(QWidget):
         self._rebuild_chain_list()
         self._reload_current_plugin_ui()
 
-
+        # Ensure the preview fills the available width once the layout is ready.
+        QTimer.singleShot(0, self._ensure_preview_scaled)
 
     def _save_to_project(self) -> None:
         """
@@ -1195,21 +2045,19 @@ class CoverVisualizationsTab(QWidget):
             return
 
         self._set_pixmap_scaled(pixmap)
-
+   
     def _set_pixmap_scaled(self, pixmap: QPixmap) -> None:
-        target_size = self.cover_label.size()
-        if target_size.width() <= 0 or target_size.height() <= 0:
-            target_size = self.cover_label.minimumSize()
+        """
+        Scale and display a pixmap into the main cover preview label.
 
-        scaled = pixmap.scaled(
-            target_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.cover_label.setPixmap(scaled)
-        self.cover_label.setText("")
-        
-    def _set_pixmap_scaled(self, pixmap: QPixmap) -> None:
+        We keep an unscaled copy (``_display_pixmap_source``) so that subsequent
+        resize/show events can rescale from the best available source instead
+        of re-scaling an already scaled pixmap.
+        """
+        # Keep a reference to the *source* pixmap so we can rescale cleanly later.
+        # QPixmap is implicitly shared, so this is cheap.
+        self._display_pixmap_source = pixmap
+
         target_size = self.cover_label.size()
         if target_size.width() <= 0 or target_size.height() <= 0:
             target_size = self.cover_label.minimumSize()

@@ -310,7 +310,7 @@ class NeonRibbonsVisualization(BaseVisualization):
         "Depth-stacked neon ribbons forming a 3D tunnel, reacting to the "
         "energy of the audio stem."
     )
-    plugin_author = "Dr DLP"
+    plugin_author = "DrDLP"
     plugin_version = "1.0.1"
     plugin_max_inputs = 1
 

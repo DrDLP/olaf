@@ -267,13 +267,16 @@ class Project:
 # Project CRUD helpers
 # ----------------------------------------------------------------------
 
-
 def list_projects() -> List[Project]:
     """
     List all projects under PROJECTS_ROOT.
 
-    Sorted by creation time (oldest first). If creation time is missing,
-    we fall back to the filesystem order.
+    Sorted by "most recently updated" first (newest -> oldest). This matches
+    typical user expectations in the UI: the project you worked on last should
+    appear at the top.
+
+    We primarily sort on ``updated_at`` and fall back to ``created_at`` when
+    needed (older metadata or corrupted timestamps).
     """
     _init_storage()
     projects: List[Project] = []
@@ -295,13 +298,19 @@ def list_projects() -> List[Project]:
             # Corrupt / incompatible project: just skip
             continue
 
-    def sort_key(p: Project):
-        try:
-            return datetime.fromisoformat(p.created_at)
-        except Exception:
-            return datetime.min
+    def sort_key(p: Project) -> datetime:
+        # Prefer updated_at; fall back to created_at; and finally to datetime.min.
+        for field_name in ("updated_at", "created_at"):
+            try:
+                value = getattr(p, field_name, "") or ""
+                if value:
+                    return datetime.fromisoformat(value)
+            except Exception:
+                pass
+        return datetime.min
 
-    projects.sort(key=sort_key)
+    # Newest first
+    projects.sort(key=sort_key, reverse=True)
     return projects
 
 

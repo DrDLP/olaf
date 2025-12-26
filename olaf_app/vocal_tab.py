@@ -4,8 +4,9 @@ from pathlib import Path
 from typing import Optional, List, Any
 import json
 import shutil
+import copy
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QSettings
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtGui import QColor, QPalette, QPainter, QPen, QBrush, QFontMetrics
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtWidgets import (
     QWidget,
@@ -28,10 +29,9 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QSlider,
     QInputDialog,
+    QLineEdit,
+    QSizePolicy,
 )
-
-
-
 
 from .project_manager import Project
 from .vocal_alignment import run_alignment_for_project
@@ -42,6 +42,752 @@ try:
 except Exception:  # pragma: no cover
     torch = None
 
+
+class WordTimelineWidget(QWidget):
+    """
+    Visual editor for word timings inside a single phrase.
+
+    UX goals:
+    - Allow gaps ("holes") between words (do NOT auto-fill).
+    - Edit each word independently (drag start or end handle).
+    - Prevent overlaps with neighboring words (soft clamps).
+    - Optional: drag phrase start/end range (does NOT clamp/move words).
+
+    Playback / alignment helpers:
+    - A playhead line is drawn when set_playhead() is used.
+    - Word segments progressively "light up" as the playhead advances.
+
+    Important: the horizontal time mapping uses a *local viewport* around the phrase
+    (typically 2–5 seconds), clamped inside the neighbor-bounded allowed window
+    (phrase_min..phrase_max). This keeps the editor readable while also avoiding
+    degenerate behavior when dragging the outer handles (range collapsing).
+    """
+
+    timingsChanged = pyqtSignal(list)          # [(gidx, start, end), ...]
+    phraseChanged = pyqtSignal(float, float)   # (phrase_start, phrase_end)
+    wordSelected = pyqtSignal(object)          # global word idx or None
+    playheadMoved = pyqtSignal(float)        # playhead time in seconds (user moved)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(170)
+        self.setMouseTracking(True)
+
+        # Phrase range (editable)
+        self._phrase_idx: Optional[int] = None
+        self._phrase_start: float = 0.0
+        self._phrase_end: float = 1.0
+
+        # Allowed phrase window (neighbor-bounded), used for the timeline mapping
+        self._phrase_min: float = 0.0
+        self._phrase_max: float = 1.0
+
+        # View range used for mapping (typically equals phrase_min/max)
+        self._view_start: float = 0.0
+        self._view_end: float = 1.0
+
+        # Words for current phrase (local copies)
+        # Each: {"gidx": int, "text": str, "start": float, "end": float, "word_index": int}
+        self._words: list[dict] = []
+
+        # Playback helpers
+        self._playhead_s: Optional[float] = None
+        self._play_window: Optional[tuple[float, float]] = None
+
+        # Selection / hover / drag state
+        self._selected_local_idx: Optional[int] = None
+        self._hover_handle: Optional[tuple[str, int]] = None  # ("w_start"/"w_end", local_idx) or ("p_start"/"p_end", -1)
+        self._drag_handle: Optional[tuple[str, int]] = None
+        self._dragging: bool = False
+
+        # Constraints
+        self._min_word_dur = 0.060
+        self._min_phrase_span = 0.050
+        self._handle_px = 6
+        self._margin = 12
+
+
+        # Viewport policy (readability):
+        # Keep the visible window around the phrase within a small span (2–5s),
+        # clamped to the allowed neighbor window (phrase_min..phrase_max).
+        self._view_min_span_s = 2.0
+        self._view_max_span_s = 5.0
+        self._view_pad_s = 0.75
+        # Render geometry
+        self._ruler_y = 40
+        self._bar_y = 72
+        self._bar_h = 34
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def set_phrase(
+        self,
+        phrase_idx: int,
+        phrase_start: float,
+        phrase_end: float,
+        words: list[dict],
+        phrase_min: float,
+        phrase_max: float,
+    ) -> None:
+        """Update the phrase and word list displayed by the editor."""
+        self._phrase_idx = int(phrase_idx)
+        self._phrase_start = float(phrase_start)
+        self._phrase_end = float(phrase_end)
+
+        # Allowed bounds (neighbor constraints)
+        self._phrase_min = float(phrase_min)
+        self._phrase_max = float(phrase_max)
+        if self._phrase_max <= self._phrase_min + 1e-6:
+            # Defensive: ensure a usable view span
+            self._phrase_max = self._phrase_min + max(self._phrase_end - self._phrase_start, 0.25)
+
+        # Defensive: avoid zero-length phrase
+        if self._phrase_end <= self._phrase_start + 1e-6:
+            self._phrase_end = self._phrase_start + 0.25
+
+        # View range used for mapping:
+        # Keep a small readable viewport around the phrase (2–5 seconds),
+        # clamped inside the allowed neighbor window (phrase_min..phrase_max).
+        phrase_dur = max(self._phrase_end - self._phrase_start, 0.0)
+        # Ensure the viewport contains the full phrase. If the phrase itself is longer than the max,
+        # we fall back to the phrase duration (cannot reasonably cap it).
+        base_span = phrase_dur + 2.0 * float(self._view_pad_s)
+        span = min(float(self._view_max_span_s), max(float(self._view_min_span_s), base_span))
+        if phrase_dur > span:
+            span = phrase_dur
+
+        center = 0.5 * (self._phrase_start + self._phrase_end)
+        view_start = center - 0.5 * span
+        view_end = view_start + span
+
+        # Clamp viewport to allowed bounds by shifting (preserve span when possible)
+        if view_start < self._phrase_min:
+            shift = self._phrase_min - view_start
+            view_start += shift
+            view_end += shift
+        if view_end > self._phrase_max:
+            shift = view_end - self._phrase_max
+            view_start -= shift
+            view_end -= shift
+
+        # Final clamp (in case the allowed window is smaller than our desired span)
+        view_start = max(self._phrase_min, view_start)
+        view_end = min(self._phrase_max, view_end)
+        if view_end <= view_start + 1e-6:
+            # Defensive: ensure a usable view span
+            view_start = self._phrase_start
+            view_end = max(self._phrase_end, view_start + 1.0)
+
+        self._view_start = float(view_start)
+        self._view_end = float(view_end)
+
+        # Keep a local copy, sorted by (start, word_index) for deterministic visuals
+        self._words = sorted(
+            [dict(w) for w in (words or [])],
+            key=lambda x: (float(x.get("start", 0.0)), int(x.get("word_index", 0))),
+        )
+
+        # Reset selection if out of range
+        if self._selected_local_idx is not None and not (0 <= self._selected_local_idx < len(self._words)):
+            self._selected_local_idx = None
+            self.wordSelected.emit(None)
+
+        self.update()
+
+    def set_selected_global_idx(self, gidx: Optional[int]) -> None:
+        """Select a word by its global index (used by parent to sync selection)."""
+        if gidx is None:
+            self._selected_local_idx = None
+            self.wordSelected.emit(None)
+            self.update()
+            return
+
+        for i, w in enumerate(self._words):
+            if int(w.get("gidx", -1)) == int(gidx):
+                self._selected_local_idx = i
+                self.wordSelected.emit(int(gidx))
+                self.update()
+                return
+
+        self._selected_local_idx = None
+        self.wordSelected.emit(None)
+        self.update()
+
+    def get_selected_global_idx(self) -> Optional[int]:
+        """Return selected global word index or None."""
+        if self._selected_local_idx is None:
+            return None
+        if 0 <= self._selected_local_idx < len(self._words):
+            return int(self._words[self._selected_local_idx].get("gidx", -1))
+        return None
+
+    def set_playhead(self, playhead_s: Optional[float]) -> None:
+        """
+        Set the current playhead time (seconds) for the visual helper.
+        This does NOT move any timings: it only affects painting.
+        """
+        if playhead_s is None:
+            self._playhead_s = None
+            self.update()
+            return
+        self._playhead_s = float(playhead_s)
+        self.update()
+
+    def get_playhead(self) -> Optional[float]:
+        """Return the current playhead time in seconds (or None)."""
+        return None if self._playhead_s is None else float(self._playhead_s)
+
+    def set_play_window(self, start_s: Optional[float], end_s: Optional[float]) -> None:
+        """
+        Optional: show a (start, end) playback window on the timeline.
+        Useful when playing a phrase with pre/post-roll and/or looping.
+        """
+        if start_s is None or end_s is None:
+            self._play_window = None
+            self.update()
+            return
+        a = float(start_s)
+        b = float(end_s)
+        if b < a:
+            a, b = b, a
+        self._play_window = (a, b)
+        self.update()
+
+    # ------------------------------------------------------------------
+    # Mapping helpers (based on view_start/view_end)
+    # ------------------------------------------------------------------
+
+    def _time_to_x(self, t: float) -> float:
+        w = max(self.width() - 2 * self._margin, 10)
+        dur = max(self._view_end - self._view_start, 1e-6)
+        return self._margin + (float(t) - self._view_start) / dur * w
+
+    def _x_to_time(self, x: float) -> float:
+        w = max(self.width() - 2 * self._margin, 10)
+        dur = max(self._view_end - self._view_start, 1e-6)
+        u = (float(x) - self._margin) / w
+        u = max(0.0, min(1.0, u))
+        return self._view_start + u * dur
+
+    def _bar_rect(self) -> tuple[int, int, int, int]:
+        x0 = self._margin
+        x1 = self.width() - self._margin
+        return (x0, self._bar_y, x1 - x0, self._bar_h)
+
+    def _choose_tick_step(self, dur: float) -> float:
+        """
+        Pick a nice tick step to get a readable ruler (roughly 6-12 ticks).
+        """
+        dur = max(float(dur), 1e-6)
+        candidates = [0.05, 0.10, 0.25, 0.50, 1.0, 2.0, 5.0]
+        target = dur / 9.0
+        best = candidates[0]
+        best_err = abs(best - target)
+        for c in candidates[1:]:
+            err = abs(c - target)
+            if err < best_err:
+                best = c
+                best_err = err
+        return best
+
+    # ------------------------------------------------------------------
+    # Painting
+    # ------------------------------------------------------------------
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        bar_x, bar_y, bar_w, bar_h = self._bar_rect()
+        bar_x0 = bar_x
+        bar_x1 = bar_x + bar_w
+
+        # Phrase header
+        p.setPen(QPen(QColor(200, 200, 200, 220), 1))
+        p.drawText(
+            self._margin,
+            22,
+            f"Phrase range: {self._phrase_start:0.3f} → {self._phrase_end:0.3f}  (drag word start/end handles; gaps allowed)",
+        )
+
+        # Ruler (ticks) across the allowed window
+        view_dur = max(self._view_end - self._view_start, 1e-6)
+        tick_step = self._choose_tick_step(view_dur)
+
+        p.setPen(QPen(QColor(140, 140, 140, 130), 1))
+        p.drawLine(int(bar_x0), self._ruler_y, int(bar_x1), self._ruler_y)
+
+        fm = QFontMetrics(p.font())
+        n_ticks = int(view_dur / tick_step) + 1
+        for k in range(n_ticks + 1):
+            t = self._view_start + k * tick_step
+            if t > self._view_end + 1e-6:
+                break
+            x = self._time_to_x(t)
+            p.setPen(QPen(QColor(140, 140, 140, 130), 1))
+            p.drawLine(int(x), self._ruler_y - 4, int(x), self._ruler_y + 4)
+
+            # Show labels relative to phrase start (may be negative on the left side)
+            label = f"{(t - self._phrase_start):+0.2f}"
+            tw = fm.horizontalAdvance(label)
+            p.setPen(QPen(QColor(170, 170, 170, 160), 1))
+            p.drawText(int(x - tw / 2), self._ruler_y - 8, label)
+
+        # Timeline background (allowed window)
+        p.setPen(QPen(QColor(120, 120, 120, 160), 1))
+        p.setBrush(QBrush(QColor(80, 80, 80, 50)))
+        p.drawRoundedRect(bar_x0, bar_y, bar_w, bar_h, 6, 6)
+
+        # Phrase window overlay (where words are expected to live)
+        ps = max(self._view_start, min(self._phrase_start, self._view_end))
+        pe = max(self._view_start, min(self._phrase_end, self._view_end))
+        if pe < ps:
+            ps, pe = pe, ps
+
+        psx = self._time_to_x(ps)
+        pex = self._time_to_x(pe)
+
+        if pex > psx + 1:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(0, 180, 255, 18)))
+            p.drawRoundedRect(int(psx), bar_y + 1, max(int(pex - psx), 2), bar_h - 2, 6, 6)
+
+        # Optional play window overlay (pre/post-roll)
+        if self._play_window is not None:
+            a, b = self._play_window
+            a = max(self._view_start, min(a, self._view_end))
+            b = max(self._view_start, min(b, self._view_end))
+            if b > a + 1e-6:
+                ax = self._time_to_x(a)
+                bx = self._time_to_x(b)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(0, 255, 255, 22)))
+                p.drawRoundedRect(int(ax), bar_y + 1, max(int(bx - ax), 2), bar_h - 2, 6, 6)
+
+        # Phrase handles at actual phrase start/end (not at bar extremes)
+        # Make them visually distinct from word handles (taller + double line).
+        ph_top = bar_y - 14
+        ph_bot = bar_y + bar_h + 14
+        ph_gap = 3
+
+        for xh, kind in ((psx, "p_start"), (pex, "p_end")):
+            is_hover = (self._hover_handle == (kind, -1))
+            col = QColor(255, 200, 80, 240) if is_hover else QColor(240, 240, 240, 220)
+            w = 3 if is_hover else 2
+            p.setPen(QPen(col, w))
+            # Double line (two close parallels)
+            p.drawLine(int(xh - ph_gap), ph_top, int(xh - ph_gap), ph_bot)
+            p.drawLine(int(xh + ph_gap), ph_top, int(xh + ph_gap), ph_bot)
+
+        # Draw word segments (with playhead "illumination")
+        playhead = self._playhead_s
+        for i, w in enumerate(self._words):
+            ws = float(w.get("start", self._phrase_start))
+            we = float(w.get("end", ws))
+
+            # For display only: clamp inside view
+            ws_d = max(self._view_start, min(ws, self._view_end))
+            we_d = max(self._view_start, min(we, self._view_end))
+            if we_d < ws_d:
+                we_d = ws_d
+
+            x0 = self._time_to_x(ws_d)
+            x1 = self._time_to_x(we_d)
+
+            is_selected = (self._selected_local_idx == i)
+
+            # Time-based illumination
+            alpha = 70
+            border_alpha = 190
+            progress_u = 0.0
+            is_current = False
+            if playhead is not None:
+                if playhead >= we:
+                    alpha = 140
+                    border_alpha = 220
+                elif ws <= playhead < we:
+                    alpha = 190
+                    border_alpha = 240
+                    is_current = True
+                    denom = max(we - ws, 1e-6)
+                    progress_u = max(0.0, min(1.0, (playhead - ws) / denom))
+                else:
+                    alpha = 55
+                    border_alpha = 160
+
+            # Selection still wins
+            if is_selected:
+                p.setPen(QPen(QColor(30, 140, 255, 240), 2))
+                p.setBrush(QBrush(QColor(30, 140, 255, max(alpha, 110))))
+            else:
+                p.setPen(QPen(QColor(30, 140, 255, border_alpha), 1))
+                p.setBrush(QBrush(QColor(30, 140, 255, alpha)))
+
+            p.drawRoundedRect(int(x0), bar_y + 2, max(int(x1 - x0), 2), bar_h - 4, 4, 4)
+
+            # Current-word progress overlay (sub-fill)
+            if is_current and (x1 - x0) > 2:
+                px1 = x0 + (x1 - x0) * progress_u
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(QColor(255, 255, 255, 35)))
+                p.drawRoundedRect(int(x0), bar_y + 2, max(int(px1 - x0), 2), bar_h - 4, 4, 4)
+
+            # Start/end handles for this word
+            sx = self._time_to_x(ws_d)
+            ex = self._time_to_x(we_d)
+            start_col = QColor(255, 200, 80, 240) if self._hover_handle == ("w_start", i) else QColor(220, 220, 220, 160)
+            end_col = QColor(255, 200, 80, 240) if self._hover_handle == ("w_end", i) else QColor(220, 220, 220, 160)
+
+            p.setPen(QPen(start_col, 2 if self._hover_handle == ("w_start", i) else 1))
+            p.drawLine(int(sx), bar_y - 6, int(sx), bar_y + bar_h + 6)
+
+            p.setPen(QPen(end_col, 2 if self._hover_handle == ("w_end", i) else 1))
+            p.drawLine(int(ex), bar_y - 6, int(ex), bar_y + bar_h + 6)
+
+
+            # In-segment drag affordances: grab << (start) or >> (end) inside the segment.
+            # This helps when multiple handles overlap (end of previous == start of next).
+            seg_w = float(x1 - x0)
+            icon_w = 18
+            icon_h = 14
+            icon_y = int(bar_y + (bar_h - icon_h) / 2)
+
+            if seg_w >= (2 * icon_w + 10):
+                # Start icon rect
+                sx0 = int(x0) + 3
+                sx1 = sx0 + icon_w
+                ex1 = int(x1) - 3
+                ex0 = ex1 - icon_w
+
+                # Start icon
+                start_hover = (self._hover_handle == ("w_start", i))
+                pen_col = QColor(255, 200, 80, 240) if start_hover else QColor(255, 255, 255, 140)
+                p.setPen(QPen(pen_col, 1))
+                p.setBrush(QBrush(QColor(0, 0, 0, 70)))
+                p.drawRoundedRect(sx0, icon_y, icon_w, icon_h, 4, 4)
+                p.drawText(sx0 + 3, icon_y + icon_h - 3, "<<")
+
+                # End icon
+                end_hover = (self._hover_handle == ("w_end", i))
+                pen_col = QColor(255, 200, 80, 240) if end_hover else QColor(255, 255, 255, 140)
+                p.setPen(QPen(pen_col, 1))
+                p.setBrush(QBrush(QColor(0, 0, 0, 70)))
+                p.drawRoundedRect(ex0, icon_y, icon_w, icon_h, 4, 4)
+                p.drawText(ex0 + 4, icon_y + icon_h - 3, ">>")
+
+            # Word label (centered on the segment, with elide if needed)
+            txt = str(w.get("text", "")).strip()
+            if txt:
+                # Define a safe text area inside the segment.
+                # If the in-segment icons (<< / >>) are visible, keep the text away from them.
+                seg_left = float(x0) + 3.0
+                seg_right = float(x1) - 3.0
+
+                if seg_w >= (2 * icon_w + 10):
+                    seg_left = float(x0) + 3.0 + float(icon_w) + 6.0
+                    seg_right = float(x1) - 3.0 - float(icon_w) - 6.0
+
+                max_w = max(int(seg_right - seg_left), 0)
+                label = fm.elidedText(txt, Qt.TextElideMode.ElideRight, max_w)
+
+                tw = fm.horizontalAdvance(label)
+                tx = seg_left + max(0.0, (seg_right - seg_left - tw) / 2.0)
+
+                # Vertically center inside the bar. drawText() expects a baseline (not a top-left).
+                ty = int(bar_y + (bar_h + fm.ascent() - fm.descent()) / 2)
+
+                p.setPen(QPen(QColor(240, 240, 240, 230), 1))
+                p.drawText(int(tx), int(ty), label)
+
+        # Playhead line + small label
+        if playhead is not None:
+            t = max(self._view_start, min(float(playhead), self._view_end))
+            x = self._time_to_x(t)
+
+            p.setPen(QPen(QColor(255, 255, 255, 190), 2))
+            p.drawLine(int(x), self._ruler_y - 2, int(x), bar_y + bar_h + 10)
+
+            rel = float(playhead) - float(self._phrase_start)
+            badge = f"{rel:+0.3f}s"
+            tw = fm.horizontalAdvance(badge)
+            bx = int(x - tw / 2) - 4
+            by = self._ruler_y + 8
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(0, 0, 0, 120)))
+            p.drawRoundedRect(bx, by, tw + 8, 18, 6, 6)
+            p.setPen(QPen(QColor(255, 255, 255, 220), 1))
+            p.drawText(bx + 4, by + 13, badge)
+
+        p.end()
+
+    # ------------------------------------------------------------------
+    # Hit-testing helpers
+    # ------------------------------------------------------------------
+
+    def _hit_test_handle(self, x: float, y: float) -> Optional[tuple[str, int]]:
+        """Return which handle is under the mouse, if any.
+
+        Priority:
+          1) Phrase edges
+          2) In-segment icons (<< / >>) to disambiguate overlapping word handles
+          3) Raw handle lines
+        """
+        if not (self._bar_y - 20 <= y <= self._bar_y + self._bar_h + 20):
+            return None
+
+        # Phrase edges (at phrase start/end positions)
+        psx = self._time_to_x(self._phrase_start)
+        pex = self._time_to_x(self._phrase_end)
+        if abs(x - psx) <= self._handle_px:
+            return ("p_start", -1)
+        if abs(x - pex) <= self._handle_px:
+            return ("p_end", -1)
+
+        # Word start/end handles (icons first, then raw lines)
+        icon_w = 18
+        icon_h = 14
+        icon_y0 = self._bar_y + int((self._bar_h - icon_h) / 2)
+        icon_y1 = icon_y0 + icon_h
+
+        for i, w in enumerate(self._words):
+            ws = float(w.get("start", self._phrase_start))
+            we = float(w.get("end", ws))
+
+            # Clamp to current viewport for hit-testing / drawing coherence
+            ws_d = max(self._view_start, min(ws, self._view_end))
+            we_d = max(self._view_start, min(we, self._view_end))
+
+            x0 = self._time_to_x(min(ws_d, we_d))
+            x1 = self._time_to_x(max(ws_d, we_d))
+
+            # Prefer clicking on the icons inside the segment
+            if (x1 - x0) >= (2 * icon_w + 10) and (icon_y0 <= y <= icon_y1):
+                sx0 = int(x0) + 3
+                sx1 = sx0 + icon_w
+                ex1 = int(x1) - 3
+                ex0 = ex1 - icon_w
+
+                if sx0 <= x <= sx1:
+                    return ("w_start", i)
+                if ex0 <= x <= ex1:
+                    return ("w_end", i)
+
+            # Raw handle lines
+            sx = self._time_to_x(ws_d)
+            ex = self._time_to_x(we_d)
+            if abs(x - sx) <= self._handle_px:
+                return ("w_start", i)
+            if abs(x - ex) <= self._handle_px:
+                return ("w_end", i)
+
+        return None
+
+        # Phrase edges (at phrase start/end positions)
+        psx = self._time_to_x(self._phrase_start)
+        pex = self._time_to_x(self._phrase_end)
+        if abs(x - psx) <= self._handle_px:
+            return ("p_start", -1)
+        if abs(x - pex) <= self._handle_px:
+            return ("p_end", -1)
+
+        # Word start/end handles
+        for i, w in enumerate(self._words):
+            ws = float(w.get("start", self._phrase_start))
+            we = float(w.get("end", ws))
+            ws_d = max(self._view_start, min(ws, self._view_end))
+            we_d = max(self._view_start, min(we, self._view_end))
+            sx = self._time_to_x(ws_d)
+            ex = self._time_to_x(we_d)
+            if abs(x - sx) <= self._handle_px:
+                return ("w_start", i)
+            if abs(x - ex) <= self._handle_px:
+                return ("w_end", i)
+
+        return None
+
+    def _hit_test_word(self, x: float, y: float) -> Optional[int]:
+        """Return local word index if a word segment is clicked, else None."""
+        if not (self._bar_y <= y <= self._bar_y + self._bar_h):
+            return None
+
+        for i, w in enumerate(self._words):
+            ws = float(w.get("start", self._phrase_start))
+            we = float(w.get("end", ws))
+            ws_d = max(self._view_start, min(ws, self._view_end))
+            we_d = max(self._view_start, min(we, self._view_end))
+            x0 = self._time_to_x(ws_d)
+            x1 = self._time_to_x(we_d)
+            if x0 <= x <= x1:
+                return i
+        return None
+
+    # ------------------------------------------------------------------
+    # Mouse interaction
+    # ------------------------------------------------------------------
+
+    def _set_playhead_from_x(self, x: float) -> None:
+        """Move playhead from an x coordinate and notify listeners."""
+        t = float(self._x_to_time(float(x)))
+        self.set_playhead(t)
+        try:
+            self.playheadMoved.emit(float(t))
+        except Exception:
+            pass
+
+    def mouseMoveEvent(self, event):  # noqa: N802
+        x = float(event.position().x())
+        y = float(event.position().y())
+
+        self._hover_handle = self._hit_test_handle(x, y)
+
+        if self._dragging and self._drag_handle is not None:
+            kind, idx = self._drag_handle
+            if kind == "playhead":
+                self._set_playhead_from_x(x)
+                self.update()
+                return
+            if kind in ("w_start", "w_end"):
+                self._apply_word_handle_drag(kind, idx, x)
+                self.update()
+                return
+            if kind in ("p_start", "p_end"):
+                self._apply_phrase_edge_drag(kind, x)
+                self.update()
+                return
+
+        self.update()
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        x = float(event.position().x())
+        y = float(event.position().y())
+
+        self._dragging = False
+        self._drag_handle = None
+
+        # 1) Handles have priority (word/phrase edges)
+        handle = self._hit_test_handle(x, y)
+        if handle is not None:
+            self._dragging = True
+            self._drag_handle = handle
+            return
+
+        # 2) Clicking a word selects it (no timing change)
+        widx = self._hit_test_word(x, y)
+        if widx is not None:
+            self._selected_local_idx = int(widx)
+            gidx = int(self._words[widx].get("gidx", -1))
+            self.wordSelected.emit(gidx if gidx >= 0 else None)
+            self.update()
+            return
+
+        # 3) Clicking empty timeline moves the playhead (and can be dragged)
+        in_timeline_band = (self._ruler_y - 18) <= y <= (self._bar_y + self._bar_h + 18)
+        if in_timeline_band:
+            self._dragging = True
+            self._drag_handle = ("playhead", -1)
+            self._set_playhead_from_x(x)
+            self.update()
+            return
+
+        # 4) Click outside clears selection
+        if self._selected_local_idx is not None:
+            self._selected_local_idx = None
+            self.wordSelected.emit(None)
+            self.update()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._dragging and self._drag_handle is not None:
+            kind, _idx = self._drag_handle
+            if kind in ("w_start", "w_end"):
+                self._emit_word_timings()
+            elif kind in ("p_start", "p_end"):
+                self.phraseChanged.emit(float(self._phrase_start), float(self._phrase_end))
+
+        self._dragging = False
+        self._drag_handle = None
+        self.update()
+
+
+    # ------------------------------------------------------------------
+    # Drag application logic
+    # ------------------------------------------------------------------
+
+    def _apply_word_handle_drag(self, kind: str, local_idx: int, x: float) -> None:
+        """Drag a word start or end handle without forcing gaps to close."""
+        if local_idx < 0 or local_idx >= len(self._words):
+            return
+
+        t = self._x_to_time(x)
+
+        # Clamp inside phrase range
+        t = max(self._phrase_start, min(t, self._phrase_end))
+
+        w = self._words[local_idx]
+        cur_s = float(w.get("start", self._phrase_start))
+        cur_e = float(w.get("end", cur_s))
+
+        # Neighbor overlap prevention (allow gaps)
+        prev_end = None
+        next_start = None
+        if local_idx > 0:
+            prev_end = float(self._words[local_idx - 1].get("end", self._phrase_start))
+        if local_idx + 1 < len(self._words):
+            next_start = float(self._words[local_idx + 1].get("start", self._phrase_end))
+
+        if kind == "w_start":
+            t_max = cur_e - self._min_word_dur
+            if prev_end is not None:
+                t = max(t, prev_end)
+            t = min(t, t_max)
+            w["start"] = float(t)
+
+        elif kind == "w_end":
+            t_min = cur_s + self._min_word_dur
+            if next_start is not None:
+                t = min(t, next_start)
+            t = max(t, t_min)
+            w["end"] = float(t)
+
+        # Final safety
+        s2 = float(w.get("start", cur_s))
+        e2 = float(w.get("end", cur_e))
+        if e2 < s2 + self._min_word_dur:
+            w["end"] = float(s2 + self._min_word_dur)
+
+    def _apply_phrase_edge_drag(self, kind: str, x: float) -> None:
+        """
+        Drag phrase start/end; does NOT clamp/move words (prevents agglutination).
+
+        Uses the allowed window mapping (phrase_min..phrase_max), so the range
+        will not collapse to the minimal span when adjusting edges.
+        """
+        t = self._x_to_time(x)
+
+        if kind == "p_start":
+            t = max(self._phrase_min, min(t, self._phrase_end - self._min_phrase_span))
+            self._phrase_start = float(t)
+        elif kind == "p_end":
+            t = min(self._phrase_max, max(t, self._phrase_start + self._min_phrase_span))
+            self._phrase_end = float(t)
+
+        # Keep phrase inside view window
+        if self._phrase_end <= self._phrase_start + 1e-6:
+            self._phrase_end = self._phrase_start + max(self._min_phrase_span, 0.10)
+
+    def _emit_word_timings(self) -> None:
+        """Emit updated timings for parent to apply to the global word list."""
+        payload = []
+        for w in self._words:
+            gidx = w.get("gidx", None)
+            if gidx is None:
+                continue
+            payload.append((int(gidx), float(w.get("start", 0.0)), float(w.get("end", 0.0))))
+        self.timingsChanged.emit(payload)
 
 class VocalTab(QWidget):
     """
@@ -62,6 +808,22 @@ class VocalTab(QWidget):
         # Alignment data (generic: dicts or dataclasses)
         self._phrases: List[Any] = []
         self._words: List[Any] = []
+        # Snapshots for "Reset" (last saved / loaded state)
+        self._saved_phrases_snapshot: List[Any] = []
+        self._saved_words_snapshot: List[Any] = []
+
+        # Phrase selection sync between Numeric and Visual subtabs
+        self._syncing_phrase_selection: bool = False
+        self._current_phrase_idx: Optional[int] = None
+
+        # Visual editor playback loop state
+        self._visual_play_active: bool = False
+        self._visual_loop_enabled: bool = False
+        self._visual_loop_start_s: float = 0.0
+        self._visual_loop_end_s: float = 0.0
+        # Previous playback rate before entering visual slow-motion
+        self._visual_prev_playback_rate: Optional[float] = None
+
         
         # Cached media duration in milliseconds (for sliders)
         self._media_duration_ms: int = 0
@@ -78,9 +840,167 @@ class VocalTab(QWidget):
     # UI
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
+    def _build_visual_alignment_tab(self) -> QWidget:
+        """Build the 'Lyrics alignment (visual)' sub-tab."""
+        tab = QWidget(self)
+        root = QHBoxLayout(tab)
+
+        # Left column: phrase list + playback
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Phrases:", tab))
+
+        self.visual_phrase_list = QListWidget(tab)
+        self.visual_phrase_list.setMinimumWidth(360)
+        left.addWidget(self.visual_phrase_list, 1)
+
+        play_group = QGroupBox("Phrase playback", tab)
+        pg = QVBoxLayout(play_group)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Pre-roll (s):", play_group))
+        self.spin_visual_preroll = QDoubleSpinBox(play_group)
+        self.spin_visual_preroll.setRange(0.0, 10.0)
+        self.spin_visual_preroll.setDecimals(2)
+        self.spin_visual_preroll.setSingleStep(0.25)
+        self.spin_visual_preroll.setValue(0.50)
+        row1.addWidget(self.spin_visual_preroll)
+
+        row1.addWidget(QLabel("Post-roll (s):", play_group))
+        self.spin_visual_postroll = QDoubleSpinBox(play_group)
+        self.spin_visual_postroll.setRange(0.0, 10.0)
+        self.spin_visual_postroll.setDecimals(2)
+        self.spin_visual_postroll.setSingleStep(0.25)
+        self.spin_visual_postroll.setValue(0.50)
+        row1.addWidget(self.spin_visual_postroll)
+        row1.addStretch(1)
+        pg.addLayout(row1)
+
+
+        row_speed = QHBoxLayout()
+        row_speed.addWidget(QLabel("Speed:", play_group))
+        self.combo_visual_speed = QComboBox(play_group)
+        self.combo_visual_speed.addItem("1.00x", 1.0)
+        self.combo_visual_speed.addItem("0.75x", 0.75)
+        self.combo_visual_speed.addItem("0.50x", 0.50)
+        self.combo_visual_speed.addItem("0.33x", 1.0 / 3.0)
+        self.combo_visual_speed.addItem("0.25x", 0.25)
+        self.combo_visual_speed.setCurrentIndex(0)
+        row_speed.addWidget(self.combo_visual_speed)
+        row_speed.addStretch(1)
+        pg.addLayout(row_speed)
+
+        row2 = QHBoxLayout()
+        self.chk_visual_loop = QCheckBox("Loop", play_group)
+        self.chk_visual_loop.setChecked(False)
+        row2.addWidget(self.chk_visual_loop)
+
+        self.btn_visual_play = QPushButton("Play phrase", play_group)
+        self.btn_visual_stop = QPushButton("Stop", play_group)
+        row2.addWidget(self.btn_visual_play)
+        row2.addWidget(self.btn_visual_stop)
+        row2.addStretch(1)
+        pg.addLayout(row2)
+
+        play_group.setLayout(pg)
+        left.addWidget(play_group, 0)
+
+        root.addLayout(left, 0)
+
+        # Right column: timeline + word editor
+        right = QVBoxLayout()
+
+        tl_group = QGroupBox("Visual timing editor", tab)
+        tl_layout = QVBoxLayout(tl_group)
+
+        self.lbl_visual_playhead = QLabel("Playhead: --", tl_group)
+        tl_layout.addWidget(self.lbl_visual_playhead)
+
+        self.visual_timeline = WordTimelineWidget(tl_group)
+        tl_layout.addWidget(self.visual_timeline, 1)
+
+        tl_help = QLabel(
+            "Tip: drag a word's START or END handle independently (gaps are allowed).\n"
+            "Drag the outermost phrase edges only if you need to adjust the phrase range.",
+            tl_group,
+        )
+        tl_help.setWordWrap(True)
+        tl_layout.addWidget(tl_help)
+
+        tl_group.setLayout(tl_layout)
+        right.addWidget(tl_group, 1)
+
+        editor_group = QGroupBox("Selected word", tab)
+        eg = QVBoxLayout(editor_group)
+
+        row_txt = QHBoxLayout()
+        row_txt.addWidget(QLabel("Text:", editor_group))
+        self.edit_visual_word_text = QLineEdit(editor_group)
+        row_txt.addWidget(self.edit_visual_word_text, 1)
+        eg.addLayout(row_txt)
+
+        row_t = QHBoxLayout()
+        row_t.addWidget(QLabel("Start (s):", editor_group))
+        self.spin_visual_word_start = QDoubleSpinBox(editor_group)
+        self.spin_visual_word_start.setRange(0.0, 99999.0)
+        self.spin_visual_word_start.setDecimals(3)
+        self.spin_visual_word_start.setSingleStep(0.01)
+        row_t.addWidget(self.spin_visual_word_start)
+
+        row_t.addWidget(QLabel("End (s):", editor_group))
+        self.spin_visual_word_end = QDoubleSpinBox(editor_group)
+        self.spin_visual_word_end.setRange(0.0, 99999.0)
+        self.spin_visual_word_end.setDecimals(3)
+        self.spin_visual_word_end.setSingleStep(0.01)
+        row_t.addWidget(self.spin_visual_word_end)
+
+        row_t.addStretch(1)
+        eg.addLayout(row_t)
+
+        row_btn = QHBoxLayout()
+        self.btn_visual_apply_word = QPushButton("Apply", editor_group)
+        self.btn_visual_insert_word = QPushButton("Insert word…", editor_group)
+        self.btn_visual_delete_word = QPushButton("Delete word", editor_group)
+        row_btn.addWidget(self.btn_visual_apply_word)
+        row_btn.addWidget(self.btn_visual_insert_word)
+        row_btn.addWidget(self.btn_visual_delete_word)
+        row_btn.addStretch(1)
+        eg.addLayout(row_btn)
+
+        editor_group.setLayout(eg)
+        right.addWidget(editor_group, 0)
+
+        bottom = QHBoxLayout()
+        self.btn_visual_save = QPushButton("Save timings", tab)
+        self.btn_visual_reset = QPushButton("Reset (last saved)", tab)
+        bottom.addWidget(self.btn_visual_save)
+        bottom.addWidget(self.btn_visual_reset)
+        bottom.addStretch(1)
+        right.addLayout(bottom)
+
+        root.addLayout(right, 1)
+
+        # Connections (visual tab)
+        self.visual_phrase_list.currentItemChanged.connect(self._on_visual_phrase_selected)
+        self.visual_phrase_list.itemClicked.connect(self._on_visual_phrase_clicked)
+
+        self.visual_timeline.timingsChanged.connect(self._on_visual_word_timings_changed)
+        self.visual_timeline.playheadMoved.connect(self._on_visual_timeline_playhead_moved)
+        self.visual_timeline.phraseChanged.connect(self._on_visual_phrase_range_changed)
+        self.visual_timeline.wordSelected.connect(self._on_visual_word_selected)
+
+        self.btn_visual_play.clicked.connect(self._play_current_visual_phrase)
+        self.btn_visual_stop.clicked.connect(self._stop_visual_phrase)
+        self.chk_visual_loop.toggled.connect(self._on_visual_loop_toggled)
+        self.btn_visual_apply_word.clicked.connect(self._apply_visual_word_edit)
+        self.btn_visual_insert_word.clicked.connect(self._insert_visual_word)
+        self.btn_visual_delete_word.clicked.connect(self._delete_visual_word)
+
+        self.btn_visual_save.clicked.connect(self.save_timings_to_files)
+        self.btn_visual_reset.clicked.connect(self._reset_alignment_to_saved_snapshot)
+
+        tab.setLayout(root)
+        return tab
+
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
@@ -99,10 +1019,24 @@ class VocalTab(QWidget):
         # Tab 1: Lyrics alignment (lyrics + alignment settings)
         # --------------------------------------------------------------
         tab_lyrics = QWidget(self)
-        tab_lyrics_layout = QVBoxLayout(tab_lyrics)
 
-        # ----- Lyrics group -----
+        # Two columns:
+        # - Left: Lyrics editor (full height)
+        # - Right: Everything else (alignment settings)
+        tab_lyrics_layout = QHBoxLayout(tab_lyrics)
+        tab_lyrics_layout.setContentsMargins(0, 0, 0, 0)
+        tab_lyrics_layout.setSpacing(10)
+
+        # -------------------------
+        # LEFT COLUMN: Lyrics
+        # -------------------------
+        left_col = QWidget(tab_lyrics)
+        left_layout = QVBoxLayout(left_col)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+
         lyrics_group = QGroupBox("Lyrics", tab_lyrics)
+        lyrics_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         lg_layout = QVBoxLayout(lyrics_group)
 
         btn_row = QHBoxLayout()
@@ -117,10 +1051,22 @@ class VocalTab(QWidget):
         self.lyrics_edit.setPlaceholderText(
             "One line per phrase (verse). These lyrics are stored inside the project."
         )
-        lg_layout.addWidget(self.lyrics_edit)
+        self.lyrics_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        # Make the editor take all remaining vertical space
+        lg_layout.addWidget(self.lyrics_edit, 1)
 
         lyrics_group.setLayout(lg_layout)
-        tab_lyrics_layout.addWidget(lyrics_group)
+        left_layout.addWidget(lyrics_group, 1)
+        left_col.setLayout(left_layout)
+
+        # -------------------------
+        # RIGHT COLUMN: Settings
+        # -------------------------
+        right_col = QWidget(tab_lyrics)
+        right_layout = QVBoxLayout(right_col)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
 
         # ----- Alignment settings group -----
         settings_group = QGroupBox("Alignment settings", tab_lyrics)
@@ -140,17 +1086,31 @@ class VocalTab(QWidget):
         lang_row = QHBoxLayout()
         lang_row.addWidget(QLabel("Language:", settings_group))
         self.lang_combo = QComboBox(settings_group)
-        # First entry: auto-detect
+
+        # First entry: auto-detect (None => Whisper auto)
         self.lang_combo.addItem("Auto (detect language)", userData=None)
-        # Explicit languages (data = whisper language code)
+
+        # Explicit languages (data = Whisper language code)
         self.lang_combo.addItem("English (en)", userData="en")
         self.lang_combo.addItem("French (fr)", userData="fr")
         self.lang_combo.addItem("German (de)", userData="de")
+        self.lang_combo.addItem("Latin (la)", userData="la")
+
+        # Power-user multi-language candidates:
+        # The backend will try each candidate and keep the best alignment vs lyrics.
+        self.lang_combo.addItem("English + Latin + Auto (en,la,auto)", userData="en,la,auto")
+        self.lang_combo.addItem("Latin + English + Auto (la,en,auto)", userData="la,en,auto")
+
+        # Convenience preset for typical mixed tracks:
+        # Mostly English, with a Latin section in the middle.
+        # Note: this is NOT time-splitting; it's a candidate list evaluated globally.
+        self.lang_combo.addItem("English / Latin / English (en, la, en)", userData="en,la,en")
+
         self.lang_combo.setCurrentIndex(0)  # default = auto
         lang_row.addWidget(self.lang_combo)
         lang_row.addStretch(1)
         sg_layout.addLayout(lang_row)
-
+        
         # Audio source for alignment and karaoke
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Audio source:", settings_group))
@@ -161,7 +1121,7 @@ class VocalTab(QWidget):
         source_row.addWidget(self.audio_source_combo)
 
         self.btn_browse_manual = QPushButton("Browse…", settings_group)
-        self.btn_browse_manual.setEnabled(False)  # enabled only when "manual" is selected
+        self.btn_browse_manual.setEnabled(False)
         source_row.addWidget(self.btn_browse_manual)
 
         self.lbl_manual_path = QLabel("", settings_group)
@@ -181,7 +1141,7 @@ class VocalTab(QWidget):
         device_row.addWidget(self.chk_use_gpu)
         device_row.addWidget(self.lbl_gpu_status, 1)
         sg_layout.addLayout(device_row)
-        
+
         # Whisper decoding quality (beam search parameters)
         decode_row = QHBoxLayout()
         decode_row.addWidget(QLabel("Beam size:", settings_group))
@@ -208,7 +1168,7 @@ class VocalTab(QWidget):
         decode_row.addStretch(1)
         sg_layout.addLayout(decode_row)
 
-        # Alignment refinement parameters (lyrics ↔ recognized words)
+        # Alignment refinement parameters
         align_params_row = QHBoxLayout()
         align_params_row.addWidget(QLabel("Max search window:", settings_group))
         self.spin_max_search_window = QSpinBox(settings_group)
@@ -232,19 +1192,34 @@ class VocalTab(QWidget):
         )
         align_params_row.addWidget(self.spin_min_similarity)
         align_params_row.addStretch(1)
+
+        # Alignment passes
+        passes_row = QHBoxLayout()
+        passes_row.addWidget(QLabel("Alignment passes:", settings_group))
+        self.alignment_passes_combo = QComboBox(settings_group)
+        self.alignment_passes_combo.addItem("1 (single DP pass – fast)", userData=1)
+        self.alignment_passes_combo.addItem("2 (anchors + fill – recommended)", userData=2)
+        self.alignment_passes_combo.addItem("3 (salvage – harsh vocals)", userData=3)
+        self.alignment_passes_combo.setCurrentIndex(1)
+        self.alignment_passes_combo.setToolTip(
+            "Number of alignment passes.\n"
+            "1: single global DP (fast).\n"
+            "2: strict anchors + lenient fill (recommended for music).\n"
+            "3: adds a salvage pass for very hard sections (growls/choirs)."
+        )
+        passes_row.addWidget(self.alignment_passes_combo)
+        passes_row.addStretch(1)
+        sg_layout.addLayout(passes_row)
+
         sg_layout.addLayout(align_params_row)
 
-        # --------------------------------------------------------------
         # Advanced Whisper options (with presets)
-        # --------------------------------------------------------------
         adv_group = QGroupBox("Whisper – advanced options", settings_group)
         adv_layout = QVBoxLayout(adv_group)
 
-        # Presets row
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Preset:", adv_group))
         self.combo_whisper_preset = QComboBox(adv_group)
-        # Internal keys: "balanced", "harsh", "custom"
         self.combo_whisper_preset.addItem("Balanced music (default)", userData="balanced")
         self.combo_whisper_preset.addItem("Harsh / noisy vocals", userData="harsh")
         self.combo_whisper_preset.addItem("Custom (manual tuning)", userData="custom")
@@ -258,7 +1233,6 @@ class VocalTab(QWidget):
         preset_row.addStretch(1)
         adv_layout.addLayout(preset_row)
 
-        # Row: no_speech_threshold + condition_on_previous_text
         row_ns = QHBoxLayout()
         row_ns.addWidget(QLabel("No-speech threshold:", adv_group))
         self.spin_no_speech_threshold = QDoubleSpinBox(adv_group)
@@ -284,7 +1258,6 @@ class VocalTab(QWidget):
         row_ns.addStretch(1)
         adv_layout.addLayout(row_ns)
 
-        # Row: compression_ratio_threshold + logprob_threshold
         row_filters = QHBoxLayout()
         row_filters.addWidget(QLabel("Compression ratio max:", adv_group))
         self.spin_compression_ratio = QDoubleSpinBox(adv_group)
@@ -312,7 +1285,6 @@ class VocalTab(QWidget):
         row_filters.addStretch(1)
         adv_layout.addLayout(row_filters)
 
-        # Initial prompt for Latin / domain-specific vocabulary
         prompt_label = QLabel("Initial prompt (optional):", adv_group)
         prompt_label.setToolTip(
             "Optional text shown to Whisper before decoding.\n"
@@ -343,7 +1315,7 @@ class VocalTab(QWidget):
         # Apply default Whisper preset and connect changes
         self._apply_whisper_preset("balanced")
         self.combo_whisper_preset.currentIndexChanged.connect(self._on_whisper_preset_changed)
-        
+
         # Run alignment
         align_row = QHBoxLayout()
         self.btn_align = QPushButton("Align lyrics with audio", settings_group)
@@ -354,16 +1326,40 @@ class VocalTab(QWidget):
         self.align_progress = QProgressBar(settings_group)
         self.align_progress.setRange(0, 100)
         self.align_progress.setValue(0)
+
+        # One-line status (latest message)
         self.lbl_align_status = QLabel("Ready.", settings_group)
+
+        # Alignment summary shown after completion (coverage, passes, fills, etc.)
+        self.lbl_align_summary = QLabel("", settings_group)
+        self.lbl_align_summary.setWordWrap(True)
+        self.lbl_align_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        # Live alignment log (mirrors console debug)
+        self.txt_align_log = QTextEdit(settings_group)
+        self.txt_align_log.setReadOnly(True)
+        self.txt_align_log.setFixedHeight(140)
+        self.txt_align_log.setPlaceholderText("Alignment log will appear here…")
 
         sg_layout.addWidget(self.align_progress)
         sg_layout.addWidget(self.lbl_align_status)
+        sg_layout.addWidget(self.lbl_align_summary)
+        sg_layout.addWidget(self.txt_align_log)
 
         settings_group.setLayout(sg_layout)
-        tab_lyrics_layout.addWidget(settings_group)
-        tab_lyrics_layout.addStretch(1)
 
+        # Put settings group in right column, and keep it top-aligned
+        right_layout.addWidget(settings_group, 0)
+        right_layout.addStretch(1)
+        right_col.setLayout(right_layout)
+
+        # -------------------------
+        # Assemble the two columns
+        # -------------------------
+        tab_lyrics_layout.addWidget(left_col, 3)
+        tab_lyrics_layout.addWidget(right_col, 2)
         tab_lyrics.setLayout(tab_lyrics_layout)
+
 
         # --------------------------------------------------------------
         # Tab 2: Export (ancien Alignment management caché)
@@ -716,12 +1712,18 @@ class VocalTab(QWidget):
         tab_kara_layout.addWidget(kara_group)
         tab_kara.setLayout(tab_kara_layout)
 
+        tab_visual = self._build_visual_alignment_tab()
+
         # --------------------------------------------------------------
         # Add tabs in desired order
         # --------------------------------------------------------------
         self.sub_tabs.addTab(tab_lyrics, "Lyrics alignment")
-        self.sub_tabs.addTab(tab_kara, "Alignement management (karaoke preview)")
+        self.sub_tabs.addTab(tab_kara, "Lyrics alignment (numeric)")
+        self.sub_tabs.addTab(tab_visual, "Lyrics alignment (visual)")
         self.sub_tabs.addTab(tab_manage, "Export / Import")
+        # Remember the visual tab index to manage playback lifecycle (stop when leaving the tab)
+        self._tab_visual_index = self.sub_tabs.indexOf(tab_visual)
+        self.sub_tabs.currentChanged.connect(self._on_subtab_changed)
 
         # --------------------------------------------------------------
         # Connections at the end of UI setup
@@ -760,6 +1762,7 @@ class VocalTab(QWidget):
 
         # Phrase timing sliders (edit selected phrase)
         self.kara_scroll_list.currentItemChanged.connect(self._on_kara_phrase_selected)
+        self.kara_scroll_list.itemClicked.connect(self._on_kara_phrase_clicked)
         self.phrase_start_slider.sliderMoved.connect(self._on_phrase_start_slider_moved)
         self.phrase_end_slider.sliderMoved.connect(self._on_phrase_end_slider_moved)
         self.phrase_start_slider.sliderReleased.connect(self._on_phrase_sliders_released)
@@ -925,41 +1928,117 @@ class VocalTab(QWidget):
 
 
     def on_position_changed(self, position_ms: int):
-        """Update karaoke preview and local player UI based on current playback position."""
-        # Update local karaoke slider and track timer, regardless of alignment state
+        """
+        Update karaoke preview, visual editor playhead, and local player UI based on current playback position.
+        """
+        # --- Always keep the karaoke slider + time label in sync (even if no alignment data)
         if hasattr(self, "kara_slider"):
-            # Set slider range once duration is known
             try:
-                duration_ms = self.player.duration()
+                duration_ms = int(self.player.duration() or 0)
             except Exception:
                 duration_ms = 0
 
             if duration_ms > 0:
                 self._media_duration_ms = duration_ms
+                if self.kara_slider.maximum() == 0:
+                    self.kara_slider.setRange(0, duration_ms)
 
-            if self.kara_slider.maximum() == 0 and duration_ms > 0:
-                self.kara_slider.setRange(0, duration_ms)
-
-
-            self.kara_slider.blockSignals(True)
-            self.kara_slider.setValue(position_ms)
-            self.kara_slider.blockSignals(False)
+            try:
+                self.kara_slider.blockSignals(True)
+                self.kara_slider.setValue(int(position_ms))
+            finally:
+                self.kara_slider.blockSignals(False)
 
         if hasattr(self, "lbl_kara_track_time"):
-            seconds = position_ms / 1000.0
-            self.lbl_kara_track_time.setText(f"{seconds:7.3f} s")
+            try:
+                seconds = float(position_ms) / 1000.0
+                self.lbl_kara_track_time.setText(f"{seconds:7.3f} s")
+            except Exception:
+                pass
 
-        # Then update phrase/word highlighting only if we have alignment data
+        pos_s = float(position_ms) / 1000.0
+
+        # Keep the visual cursor aligned with actual playback time.
+        try:
+            if self.player is not None and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self._visual_cursor_time_s = float(pos_s)
+        except Exception:
+            pass
+
+
+        # --- Visual editor helpers: playhead line + numeric timer
+        if hasattr(self, "visual_timeline"):
+            try:
+                self.visual_timeline.set_playhead(pos_s)
+            except Exception:
+                pass
+
+        if hasattr(self, "lbl_visual_playhead"):
+            try:
+                if getattr(self, "_current_phrase_idx", None) is not None and self._current_phrase_idx < len(self._phrases):
+                    ph = self._phrases[int(self._current_phrase_idx)]
+                    ph_s = float(self._get_phrase_field(ph, "start") or 0.0)
+                    ph_e = float(self._get_phrase_field(ph, "end") or ph_s)
+                    rel = pos_s - ph_s
+                    self.lbl_visual_playhead.setText(
+                        f"Playhead: {pos_s:0.3f} s   |   phrase: {rel:+0.3f} s / {max(ph_e - ph_s, 0.0):0.3f} s"
+                    )
+                else:
+                    self.lbl_visual_playhead.setText(f"Playhead: {pos_s:0.3f} s")
+            except Exception:
+                pass
+
+        # --- Visual editor phrase playback loop (optional)
+        try:
+            if getattr(self, "_visual_play_active", False):
+                if pos_s >= float(getattr(self, "_visual_loop_end_s", 0.0)):
+                    if getattr(self, "_visual_loop_enabled", False):
+                        self.player.setPosition(int(float(getattr(self, "_visual_loop_start_s", 0.0)) * 1000.0))
+                    else:
+                        self.player.pause()
+                        self._visual_play_active = False
+        except Exception:
+            pass
+
+        # --- Karaoke highlight update only if we have alignment data
         if not self._phrases:
             return
 
-        pos_s = position_ms / 1000.0
         self._update_karaoke_for_time(pos_s)
 
+    def _on_subtab_changed(self, idx: int) -> None:
+        """Stop visual phrase playback when leaving the visual editor tab.
 
-    # ------------------------------------------------------------------
-    # Lyrics file management
-    # ------------------------------------------------------------------
+        This prevents stale looping state when the user toggles 'Loop' off/on and switches tabs.
+        """
+        try:
+            visual_idx = getattr(self, "_tab_visual_index", None)
+            if visual_idx is None:
+                return
+
+            leaving_visual = (int(idx) != int(visual_idx))
+            if leaving_visual:
+                # Leaving the visual tab -> stop the phrase playback and clear loop state.
+                if getattr(self, "_visual_play_active", False):
+                    self._stop_visual_phrase()
+
+                # Always force loop OFF when leaving, to avoid confusing persistent UI state.
+                self._visual_loop_enabled = False
+                try:
+                    if hasattr(self, "chk_visual_loop"):
+                        self.chk_visual_loop.setChecked(False)
+                except Exception:
+                    pass
+
+                # Safety: restore playback rate even if playback was interrupted elsewhere.
+                try:
+                    if self._visual_prev_playback_rate is not None and hasattr(self.player, "setPlaybackRate"):
+                        self.player.setPlaybackRate(float(self._visual_prev_playback_rate))
+                except Exception:
+                    pass
+                self._visual_prev_playback_rate = None
+        except Exception:
+            pass
 
     def load_lyrics_from_file(self):
         if not self._project:
@@ -1175,8 +2254,32 @@ class VocalTab(QWidget):
         # Refresh UI to reflect loaded alignment
         self.populate_segments_preview()
         self.lbl_align_status.setText("Loaded existing alignment from disk.")
+
+        # If available, also show the last saved alignment summary.
+        if self._project is not None and hasattr(self, "lbl_align_summary"):
+            try:
+                align_dir = self._project.folder / "vocal_align"
+                mpath = align_dir / "alignment_metrics.json"
+                if mpath.is_file():
+                    data = json.loads(mpath.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        metrics = data.get("metrics")
+                        chosen_lang = str(data.get("chosen_whisper_language", "") or "")
+                        if isinstance(metrics, dict):
+                            self.lbl_align_summary.setText(self._format_alignment_summary(metrics, chosen_lang))
+            except Exception:
+                pass
         
     # -------------------- Import helpers --------------------
+        # Cache as "last saved" state for the Reset button
+        self._saved_phrases_snapshot = copy.deepcopy(self._phrases)
+        self._saved_words_snapshot = copy.deepcopy(self._words)
+
+        # Refresh both phrase lists / editors
+        self._refresh_karaoke_scroll()
+        if self._current_phrase_idx is not None:
+            self._refresh_visual_editor_for_phrase(self._current_phrase_idx)
+
 
     def _open_file_dialog(self, title: str, filter_str: str) -> Optional[Path]:
         """Small helper to open a file dialog and return a Path or None if cancelled."""
@@ -1224,8 +2327,6 @@ class VocalTab(QWidget):
                 )
             return
 
-
-
         # Lyrics
         lyrics_text = self.lyrics_edit.toPlainText().strip()
         if not lyrics_text:
@@ -1256,10 +2357,7 @@ class VocalTab(QWidget):
 
         # Use combo userData to decide if we force a language or let Whisper auto-detect
         lang_data = self.lang_combo.currentData()
-        if not lang_data:  # Auto (detect language)
-            whisper_language = None
-        else:
-            whisper_language = str(lang_data)
+        whisper_language = None if not lang_data else str(lang_data)
 
         device = "cuda" if (self.chk_use_gpu.isChecked() and self._gpu_available) else "cpu"
 
@@ -1269,27 +2367,18 @@ class VocalTab(QWidget):
         max_search_window = int(self.spin_max_search_window.value()) if hasattr(self, "spin_max_search_window") else 5
         min_similarity = float(self.spin_min_similarity.value()) if hasattr(self, "spin_min_similarity") else 0.60
 
+        alignment_passes = 2
+        if hasattr(self, "alignment_passes_combo") and self.alignment_passes_combo is not None:
+            try:
+                alignment_passes = int(self.alignment_passes_combo.currentData() or 2)
+            except Exception:
+                alignment_passes = 2
+
         # Advanced Whisper filters / context / prompt
-        no_speech_threshold = (
-            float(self.spin_no_speech_threshold.value())
-            if hasattr(self, "spin_no_speech_threshold")
-            else None
-        )
-        compression_ratio_threshold = (
-            float(self.spin_compression_ratio.value())
-            if hasattr(self, "spin_compression_ratio")
-            else None
-        )
-        logprob_threshold = (
-            float(self.spin_logprob_threshold.value())
-            if hasattr(self, "spin_logprob_threshold")
-            else None
-        )
-        condition_on_previous_text = (
-            bool(self.chk_condition_prev.isChecked())
-            if hasattr(self, "chk_condition_prev")
-            else None
-        )
+        no_speech_threshold = float(self.spin_no_speech_threshold.value()) if hasattr(self, "spin_no_speech_threshold") else None
+        compression_ratio_threshold = float(self.spin_compression_ratio.value()) if hasattr(self, "spin_compression_ratio") else None
+        logprob_threshold = float(self.spin_logprob_threshold.value()) if hasattr(self, "spin_logprob_threshold") else None
+        condition_on_previous_text = bool(self.chk_condition_prev.isChecked()) if hasattr(self, "chk_condition_prev") else None
 
         initial_prompt = None
         if hasattr(self, "txt_initial_prompt"):
@@ -1299,14 +2388,113 @@ class VocalTab(QWidget):
 
         self.btn_align.setEnabled(False)
         self.align_progress.setValue(0)
-
         self.lbl_align_status.setText(f"Running alignment on {device}…")
+        if hasattr(self, "lbl_align_summary"):
+            self.lbl_align_summary.setText("")
+        if hasattr(self, "txt_align_log"):
+            try:
+                self.txt_align_log.clear()
+            except Exception:
+                pass
         QApplication.processEvents()
 
         def progress_cb(percent: float, message: str):
-            self.align_progress.setValue(int(percent))
-            self.lbl_align_status.setText(message[:150])
-            QApplication.processEvents()
+            # Keep UI responsive + log for debugging
+            try:
+                self.align_progress.setValue(int(percent))
+                self.lbl_align_status.setText(message[:200])
+                if hasattr(self, "txt_align_log"):
+                    try:
+                        self.txt_align_log.append(f"{percent:5.1f}%  {message}")
+                    except Exception:
+                        pass
+                QApplication.processEvents()
+            except Exception:
+                pass
+
+            try:
+                print(f"[Whisper/Align] {percent:5.1f}% - {message}")
+            except Exception:
+                pass
+
+        # Immediate ping: proves that the alignment call chain actually started.
+        progress_cb(0.0, f"Starting alignment (passes={alignment_passes}, device={device})…")
+
+        try:
+            result = run_alignment_for_project(
+                project=self._project,
+                audio_path=audio_path,
+                lyrics_text=lyrics_text,
+                model_name=model_name,
+                whisper_language=whisper_language,  # None => auto-detect
+                phoneme_language=None,
+                device=device,
+                beam_size=beam_size,
+                patience=patience,
+                max_search_window=max_search_window,
+                min_similarity=min_similarity,
+                alignment_passes=alignment_passes,
+                no_speech_threshold=no_speech_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
+                condition_on_previous_text=condition_on_previous_text,
+                initial_prompt=initial_prompt,
+                progress_cb=progress_cb,
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Alignment error", f"Whisper / alignment failed:\n{e}")
+            self.lbl_align_status.setText("Error during alignment.")
+            return
+        finally:
+            self.btn_align.setEnabled(True)
+
+        # Normalize alignment result (dict or dataclass)
+        self._phrases = getattr(result, "phrases", getattr(result, "lines", [])) or []
+        self._words = getattr(result, "words", []) or []
+
+        self.align_progress.setValue(100)
+        self.lbl_align_status.setText("Alignment done.")
+
+        # Show debug summary (coverage, fills, inserted phrases, etc.)
+        metrics = getattr(result, "metrics", None)
+        chosen_lang = getattr(result, "chosen_whisper_language", "") or ""
+        if metrics is None and self._project is not None:
+            # Fallback: load from disk
+            try:
+                align_dir = self._project.folder / "vocal_align"
+                mpath = align_dir / "alignment_metrics.json"
+                if mpath.is_file():
+                    data = json.loads(mpath.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        metrics = data.get("metrics")
+                        chosen_lang = str(data.get("chosen_whisper_language", chosen_lang) or chosen_lang)
+            except Exception:
+                pass
+
+        if isinstance(metrics, dict) and hasattr(self, "lbl_align_summary"):
+            self.lbl_align_summary.setText(self._format_alignment_summary(metrics, chosen_lang))
+            if hasattr(self, "txt_align_log"):
+                try:
+                    self.txt_align_log.append("")
+                    self.txt_align_log.append(self._format_alignment_summary(metrics, chosen_lang))
+                except Exception:
+                    pass
+
+        self.populate_segments_preview()
+
+
+    def progress_cb(percent: float, message: str):
+        self.align_progress.setValue(int(percent))
+        self.lbl_align_status.setText(message[:150])
+        QApplication.processEvents()
+
+        # Also print progress to stdout so pass 3 messages don't get lost in the UI.
+        try:
+            print(f"[Whisper/Align] {percent:5.1f}% - {message}")
+        except Exception:
+            pass
+
 
         try:
             # run_alignment_for_project(
@@ -1331,6 +2519,7 @@ class VocalTab(QWidget):
                 patience=patience,
                 max_search_window=max_search_window,
                 min_similarity=min_similarity,
+                alignment_passes=alignment_passes,
                 no_speech_threshold=no_speech_threshold,
                 compression_ratio_threshold=compression_ratio_threshold,
                 logprob_threshold=logprob_threshold,
@@ -1357,6 +2546,74 @@ class VocalTab(QWidget):
         self.align_progress.setValue(100)
         self.lbl_align_status.setText("Alignment done.")
         self.populate_segments_preview()
+
+    def _format_alignment_summary(self, metrics: dict, chosen_lang: str) -> str:
+        """Return a short human-readable alignment report for the UI."""
+        if not isinstance(metrics, dict):
+            return ""
+
+        total = metrics.get("lyrics_words_total")
+        matched = metrics.get("lyrics_words_matched")
+        coverage = metrics.get("coverage")
+        passes = metrics.get("passes")
+
+        def _fmt_int(x):
+            try:
+                return str(int(x))
+            except Exception:
+                return "?"
+
+        def _fmt_float(x, nd=3):
+            try:
+                return f"{float(x):.{nd}f}"
+            except Exception:
+                return "?"
+
+        parts = []
+        if passes is not None:
+            parts.append(f"passes={_fmt_int(passes)}")
+        if chosen_lang:
+            parts.append(f"chosen_lang={chosen_lang}")
+        if total is not None and matched is not None:
+            parts.append(f"coverage={_fmt_float(coverage, 3)} ({_fmt_int(matched)}/{_fmt_int(total)})")
+        elif coverage is not None:
+            parts.append(f"coverage={_fmt_float(coverage, 3)}")
+
+        # Requested debug counters
+        for k in (
+            "lyrics_words_filled_between",
+            "lyrics_words_filled_edges",
+            "phrases_inserted",
+            "lyrics_words_inserted",
+        ):
+            if k in metrics:
+                parts.append(f"{k}={_fmt_int(metrics.get(k))}")
+
+        # Similarity (useful for diagnosing over-lenient salvage)
+        if "mean_similarity" in metrics:
+            parts.append(f"mean_similarity={_fmt_float(metrics.get('mean_similarity'), 3)}")
+        if "median_similarity" in metrics:
+            parts.append(f"median_similarity={_fmt_float(metrics.get('median_similarity'), 3)}")
+
+        # Also keep a JSON-ish one-liner for copy/paste into issues.
+        compact_keys = [
+            "passes",
+            "coverage",
+            "lyrics_words_total",
+            "lyrics_words_matched",
+            "lyrics_words_filled_between",
+            "lyrics_words_filled_edges",
+            "phrases_inserted",
+            "lyrics_words_inserted",
+        ]
+        compact = {k: metrics.get(k) for k in compact_keys if k in metrics}
+        try:
+            compact_json = json.dumps(compact, ensure_ascii=False)
+        except Exception:
+            compact_json = str(compact)
+
+        return "Alignment summary: " + ", ".join(parts) + "\n" + compact_json
+
 
     # ------------------------------------------------------------------
     # Phrases list + editing
@@ -1448,12 +2705,12 @@ class VocalTab(QWidget):
                 return (0.0, self._media_duration_ms / 1000.0)
             return (0.0, 9999.0)
 
-        # Sort by start time
+        # Sort by lyrics order first (word_index), then by time as tie-breaker
         def _word_sort_key(item: tuple[int, Any]):
             wobj = item[1]
-            ws = self._get_word_field(wobj, "start")
             wi = self._get_word_field(wobj, "word_index")
-            return (ws if ws is not None else 0.0, wi if wi is not None else 0)
+            ws = self._get_word_field(wobj, "start")
+            return (wi if wi is not None else 0, ws if ws is not None else 0.0)
 
         words_for_line.sort(key=_word_sort_key)
 
@@ -1919,11 +3176,15 @@ class VocalTab(QWidget):
         self._refresh_karaoke_scroll()            
 
     def _refresh_karaoke_scroll(self) -> None:
-        """Populate the karaoke scrolling list with all phrases."""
-        if not hasattr(self, "kara_scroll_list"):
-            return
+        """Populate phrase lists (Numeric and Visual) with all phrases."""
 
-        self.kara_scroll_list.clear()
+        kara_list = getattr(self, "kara_scroll_list", None)
+        vis_list = getattr(self, "visual_phrase_list", None)
+
+        if kara_list is not None:
+            kara_list.clear()
+        if vis_list is not None:
+            vis_list.clear()
 
         if not self._phrases:
             return
@@ -1936,12 +3197,21 @@ class VocalTab(QWidget):
                 times = "[no timing]"
             else:
                 times = f"[{start:7.3f} → {end:7.3f}]"
-            item = QListWidgetItem(f"{times}  {text}")
-            # store phrase index for highlighting
-            item.setData(Qt.ItemDataRole.UserRole, idx)
-            # left-aligned text for the phrases column
-            item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
-            self.kara_scroll_list.addItem(item)
+
+            label = f"{times}  {text}"
+
+            if kara_list is not None:
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, idx)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
+                kara_list.addItem(item)
+
+            if vis_list is not None:
+                item2 = QListWidgetItem(label)
+                item2.setData(Qt.ItemDataRole.UserRole, idx)
+                item2.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
+                vis_list.addItem(item2)
+
 
     def _refresh_karaoke_words(self, line_index: Optional[int]) -> None:
         """
@@ -1965,14 +3235,17 @@ class VocalTab(QWidget):
         if not filtered:
             return
 
-        # Sort words primarily by start time, then by word_index
         def _word_sort_key(item):
             wobj = item[1]
-            ws = self._get_word_field(wobj, "start")
             wi = self._get_word_field(wobj, "word_index")
-            return (ws if ws is not None else 0.0, wi if wi is not None else 0)
+            ws = self._get_word_field(wobj, "start")
+            # Put unknown word_index at the end instead of the beginning:
+            if wi is None:
+                wi = 10**9
+            if ws is None:
+                ws = 0.0
+            return (int(wi), float(ws))
 
-        filtered.sort(key=_word_sort_key)
 
         for global_idx, w in filtered:
             text = self._get_word_field(w, "text") or ""
@@ -2023,25 +3296,485 @@ class VocalTab(QWidget):
 
         self.lbl_phrase_start_value.setText(f"Start: {start:7.3f} s")
         self.lbl_phrase_end_value.setText(f"End:   {end:7.3f} s")
+    def _refresh_visual_editor_for_phrase(self, phrase_idx: int) -> None:
+        """Push the selected phrase + its words to the timeline widget."""
+        if not hasattr(self, "visual_timeline") or self.visual_timeline is None:
+            return
+        if phrase_idx < 0 or phrase_idx >= len(self._phrases):
+            return
+
+        phrase = self._phrases[phrase_idx]
+        p_start = float(self._get_phrase_field(phrase, "start") or 0.0)
+        p_end = float(self._get_phrase_field(phrase, "end") or p_start)
+        line_index = self._get_phrase_field(phrase, "line_index")
+        if line_index is None:
+            line_index = phrase_idx
+
+        min_s, max_s = self._get_phrase_neighbor_bounds(phrase_idx)
+
+        words_for_line = []
+        for gidx, w in enumerate(self._words):
+            if self._get_word_field(w, "line_index") == line_index:
+                words_for_line.append(
+                    {
+                        "gidx": gidx,
+                        "text": self._get_word_field(w, "text") or "",
+                        "start": float(self._get_word_field(w, "start") or p_start),
+                        "end": float(self._get_word_field(w, "end") or p_start),
+                        "word_index": int(self._get_word_field(w, "word_index") or 0),
+                    }
+                )
+
+        self.visual_timeline.set_phrase(
+            phrase_idx=phrase_idx,
+            phrase_start=p_start,
+            phrase_end=p_end,
+            words=words_for_line,
+            phrase_min=float(min_s),
+            phrase_max=float(max_s),
+        )
+
+        self._set_visual_word_editor_enabled(False)
+
+    def _set_visual_word_editor_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "edit_visual_word_text"):
+            return
+        self.edit_visual_word_text.setEnabled(enabled)
+        self.spin_visual_word_start.setEnabled(enabled)
+        self.spin_visual_word_end.setEnabled(enabled)
+        self.btn_visual_apply_word.setEnabled(enabled)
+        self.btn_visual_delete_word.setEnabled(enabled)
+
+        if not enabled:
+            self.edit_visual_word_text.setText("")
+            self.spin_visual_word_start.setValue(0.0)
+            self.spin_visual_word_end.setValue(0.0)
+
+    def _on_visual_word_selected(self, gidx_obj):
+        if gidx_obj is None:
+            self._set_visual_word_editor_enabled(False)
+            return
+
+        gidx = int(gidx_obj)
+        if gidx < 0 or gidx >= len(self._words):
+            self._set_visual_word_editor_enabled(False)
+            return
+
+        w = self._words[gidx]
+        self._set_visual_word_editor_enabled(True)
+        self.edit_visual_word_text.setText(str(self._get_word_field(w, "text") or ""))
+        self.spin_visual_word_start.setValue(float(self._get_word_field(w, "start") or 0.0))
+        self.spin_visual_word_end.setValue(float(self._get_word_field(w, "end") or 0.0))
+
+    def _on_visual_word_timings_changed(self, payload: list) -> None:
+        if not payload:
+            return
+
+        for gidx, new_s, new_e in payload:
+            if gidx < 0 or gidx >= len(self._words):
+                continue
+            self._set_word_field(self._words[gidx], "start", float(new_s))
+            self._set_word_field(self._words[gidx], "end", float(new_e))
+
+        if self._current_phrase_idx is not None and 0 <= self._current_phrase_idx < len(self._phrases):
+            line_index = self._get_phrase_field(self._phrases[self._current_phrase_idx], "line_index")
+            if line_index is None:
+                line_index = self._current_phrase_idx
+            self._refresh_karaoke_words(line_index)
+
+    def _on_visual_phrase_range_changed(self, new_start: float, new_end: float) -> None:
+        if self._current_phrase_idx is None:
+            return
+        idx = int(self._current_phrase_idx)
+        if idx < 0 or idx >= len(self._phrases):
+            return
+
+        self._set_phrase_field(self._phrases[idx], "start", float(new_start))
+        self._set_phrase_field(self._phrases[idx], "end", float(new_end))
+
+        self._refresh_karaoke_scroll()
+        self._syncing_phrase_selection = True
+        try:
+            if hasattr(self, "kara_scroll_list") and self.kara_scroll_list is not None:
+                self.kara_scroll_list.setCurrentRow(idx)
+            if hasattr(self, "visual_phrase_list") and self.visual_phrase_list is not None:
+                self.visual_phrase_list.setCurrentRow(idx)
+        finally:
+            self._syncing_phrase_selection = False
+
+        self._sync_phrase_timing_panel(idx, self._phrases[idx])
+
+    def _apply_visual_word_edit(self) -> None:
+        if not hasattr(self, "visual_timeline") or self.visual_timeline is None:
+            return
+        gidx = self.visual_timeline.get_selected_global_idx()
+        if gidx is None or gidx < 0 or gidx >= len(self._words):
+            return
+
+        new_text = self.edit_visual_word_text.text().strip()
+        new_s = float(self.spin_visual_word_start.value())
+        new_e = float(self.spin_visual_word_end.value())
+        if new_e < new_s:
+            new_e = new_s
+
+        self._set_word_field(self._words[gidx], "text", new_text)
+        self._set_word_field(self._words[gidx], "start", new_s)
+        self._set_word_field(self._words[gidx], "end", new_e)
+
+        if self._current_phrase_idx is not None:
+            self._refresh_visual_editor_for_phrase(self._current_phrase_idx)
+            self.visual_timeline.set_selected_global_idx(gidx)
+
+            line_index = self._get_phrase_field(self._phrases[self._current_phrase_idx], "line_index")
+            if line_index is None:
+                line_index = self._current_phrase_idx
+            self._refresh_karaoke_words(line_index)
+
+    def _insert_visual_word(self) -> None:
+        """Insert a new word at the current *visual cursor* (playhead).
+
+        The cursor can be moved by clicking/dragging the playhead in the visual timeline.
+        We do NOT auto-fill gaps; the word is inserted into the currently available gap
+        between its nearest matched neighbors around the cursor.
+        """
+        if self._current_phrase_idx is None:
+            return
+        phrase = self._phrases[self._current_phrase_idx]
+        line_index = self._get_phrase_field(phrase, "line_index")
+        if line_index is None:
+            line_index = self._current_phrase_idx
+
+        word_text, ok = QInputDialog.getText(self, "Insert word", "Word text:")
+        if not ok:
+            return
+        word_text = (word_text or "").strip()
+        if not word_text:
+            return
+
+        p_start = float(self._get_phrase_field(phrase, "start") or 0.0)
+        p_end = float(self._get_phrase_field(phrase, "end") or p_start)
+        if p_end <= p_start:
+            p_end = p_start + 0.25
+
+        # Prefer the explicit cursor/playhead set by the user in the visual timeline.
+        cursor_s: float
+        if getattr(self, "_visual_cursor_time_s", None) is not None:
+            cursor_s = float(self._visual_cursor_time_s)
+        else:
+            cursor_s = float(self.player.position()) / 1000.0 if self.player is not None else p_start
+        cursor_s = max(p_start, min(cursor_s, p_end))
+
+        # Collect existing word intervals for the current line (allowing gaps).
+        local_words = []
+        for gidx, w in enumerate(self._words):
+            if self._get_word_field(w, "line_index") == line_index:
+                ws = float(self._get_word_field(w, "start") or p_start)
+                we = float(self._get_word_field(w, "end") or ws)
+                local_words.append((ws, we, gidx))
+        local_words.sort(key=lambda it: (it[0], it[1]))
+
+        # Determine neighbor bounds around the cursor.
+        prev_end = p_start
+        next_start = p_end
+
+        # If the cursor falls inside an existing word, insert *after* it by default.
+        inside_idx = None
+        for ws, we, gidx in local_words:
+            if ws <= cursor_s <= we:
+                inside_idx = gidx
+                prev_end = we
+                break
+
+        if inside_idx is None:
+            # Find the closest previous word (by end time)
+            for ws, we, gidx in local_words:
+                if we <= cursor_s:
+                    prev_end = max(prev_end, we)
+
+        # Find the closest next word start strictly after prev_end (or cursor if no prev)
+        for ws, we, gidx in local_words:
+            if ws >= max(cursor_s, prev_end) and ws < next_start:
+                next_start = ws
+                break
+
+        gap_start = float(prev_end)
+        gap_end = float(next_start)
+
+        min_dur = 0.060
+        default_dur = 0.200
+
+        if gap_end - gap_start < min_dur:
+            QMessageBox.warning(
+                self,
+                "No room",
+                "No free space at the current cursor position (neighbor overlap).\nMove the playhead to a gap or adjust neighbors first.",
+            )
+            return
+
+        new_s = max(gap_start, min(cursor_s, gap_end - min_dur))
+        new_e = min(gap_end, new_s + min(default_dur, max(0.0, gap_end - new_s)))
+        if new_e - new_s < min_dur:
+            new_e = min(gap_end, new_s + min_dur)
+
+        new_word = {
+            "line_index": int(line_index),
+            "text": word_text,
+            "start": float(new_s),
+            "end": float(new_e),
+        }
+        self._words.append(new_word)
+        new_gidx = len(self._words) - 1
+        self._reindex_words_for_line(int(line_index))
+        
+        self._refresh_karaoke_words(line_index)
+        self._refresh_visual_editor_for_phrase(self._current_phrase_idx)
+
+        # Select the newly inserted word for immediate editing
+        try:
+            if hasattr(self, "visual_timeline") and self.visual_timeline is not None:
+                self.visual_timeline.set_selected_global_idx(new_gidx)
+        except Exception:
+            pass
+
+
+    def _delete_visual_word(self) -> None:
+        if not hasattr(self, "visual_timeline") or self.visual_timeline is None:
+            return
+        gidx = self.visual_timeline.get_selected_global_idx()
+        if gidx is None or gidx < 0 or gidx >= len(self._words):
+            return
+
+        w = self._words[gidx]
+        txt = str(self._get_word_field(w, "text") or "")
+        reply = QMessageBox.question(
+            self,
+            "Delete word",
+            f"Delete this word?\n\n{txt}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        del self._words[gidx]
+        self._reindex_words_for_line(int(line_index))
+
+        if self._current_phrase_idx is not None:
+            phrase = self._phrases[self._current_phrase_idx]
+            line_index = self._get_phrase_field(phrase, "line_index")
+            if line_index is None:
+                line_index = self._current_phrase_idx
+            self._refresh_karaoke_words(line_index)
+            self._refresh_visual_editor_for_phrase(self._current_phrase_idx)
+
+    def _play_current_visual_phrase(self) -> None:
+        if self._current_phrase_idx is None or self._current_phrase_idx >= len(self._phrases):
+            return
+        phrase = self._phrases[self._current_phrase_idx]
+        p_start = float(self._get_phrase_field(phrase, "start") or 0.0)
+        p_end = float(self._get_phrase_field(phrase, "end") or p_start)
+
+        pre = float(self.spin_visual_preroll.value())
+        post = float(self.spin_visual_postroll.value())
+
+        start_s = max(0.0, p_start - pre)
+        end_s = max(start_s, p_end + post)
+
+        audio_path = self._get_audio_path_for_current_mode()
+        if audio_path:
+            if self.player.source().toString() != QUrl.fromLocalFile(str(audio_path)).toString():
+                self.player.setSource(QUrl.fromLocalFile(str(audio_path)))
+
+        self._visual_loop_enabled = bool(self.chk_visual_loop.isChecked())
+
+        # Apply visual slow-motion (phrase playback only).
+        # We snapshot the previous rate so we can restore it when leaving the visual tab.
+        try:
+            if self._visual_prev_playback_rate is None and hasattr(self.player, "playbackRate"):
+                self._visual_prev_playback_rate = float(self.player.playbackRate())
+        except Exception:
+            self._visual_prev_playback_rate = self._visual_prev_playback_rate or 1.0
+
+        rate = 1.0
+        try:
+            if hasattr(self, "combo_visual_speed"):
+                data = self.combo_visual_speed.currentData()
+                if data is not None:
+                    rate = float(data)
+        except Exception:
+            rate = 1.0
+
+        try:
+            if hasattr(self.player, "setPlaybackRate"):
+                self.player.setPlaybackRate(rate)
+        except Exception:
+            pass
+
+        self._visual_loop_start_s = float(start_s)
+        self._visual_loop_end_s = float(end_s)
+        self._visual_play_active = True
+
+        # Visual helper: show the playback window and reset playhead in the timeline
+        try:
+            if hasattr(self, "visual_timeline"):
+                self.visual_timeline.set_play_window(start_s, end_s)
+                self.visual_timeline.set_playhead(start_s)
+        except Exception:
+            pass
+
+        self.player.setPosition(int(start_s * 1000.0))
+        self.player.play()
+
+    def _stop_visual_phrase(self) -> None:
+        self._visual_play_active = False
+        self._visual_loop_enabled = False
+        try:
+            self.player.pause()
+        except Exception:
+            pass
+
+        # Clear the playback window overlay in the timeline
+        try:
+            if hasattr(self, "visual_timeline"):
+                self.visual_timeline.set_play_window(None, None)
+        except Exception:
+            pass
+
+        # Restore global playback speed (slow-motion is visual-tab only).
+        try:
+            if self._visual_prev_playback_rate is not None and hasattr(self.player, "setPlaybackRate"):
+                self.player.setPlaybackRate(float(self._visual_prev_playback_rate))
+        except Exception:
+            pass
+        self._visual_prev_playback_rate = None
+
+    def _on_visual_loop_toggled(self, checked: bool) -> None:
+        """Keep the visual playback loop flag in sync with the checkbox."""
+        try:
+            self._visual_loop_enabled = bool(checked)
+        except Exception:
+            self._visual_loop_enabled = False
+
+    def _reset_alignment_to_saved_snapshot(self) -> None:
+        if not self._saved_phrases_snapshot:
+            QMessageBox.information(self, "Reset", "No saved snapshot available yet. Save timings first.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Reset timings",
+            "Reset all phrase/word timings to the last saved state?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._phrases = copy.deepcopy(self._saved_phrases_snapshot)
+        self._words = copy.deepcopy(self._saved_words_snapshot)
+
+        self._refresh_karaoke_scroll()
+
+        if self._current_phrase_idx is not None and self._current_phrase_idx < len(self._phrases):
+            self._select_phrase_idx(self._current_phrase_idx, source="visual")
+        elif self._phrases:
+            self._select_phrase_idx(0, source="visual")
+
 
     def _on_kara_phrase_selected(self, current: QListWidgetItem, previous: QListWidgetItem):
-        """When a phrase is selected in the karaoke list, sync sliders, seek audio, and show words."""
+        """Numeric tab phrase selection handler (syncs with Visual tab)."""
+        if getattr(self, "_syncing_phrase_selection", False):
+            return
         if current is None:
             return
         idx = current.data(Qt.ItemDataRole.UserRole)
         if idx is None or not isinstance(idx, int):
             return
+        self._select_phrase_idx(idx, source="kara")
+
+    
+    def _on_kara_phrase_clicked(self, item: QListWidgetItem) -> None:
+        """User clicked a phrase in the Numeric editor list.
+
+        `currentItemChanged` does not fire when the user clicks the already-selected item.
+        This handler ensures we can always restart playback from the phrase start.
+        """
+        if item is None:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or not isinstance(idx, int):
+            return
+        self._select_phrase_idx(idx, source="kara")
+        try:
+            self.player.play()
+        except Exception:
+            pass
+
+    def _on_visual_phrase_clicked(self, item: QListWidgetItem) -> None:
+        """User clicked a phrase in the Visual editor list (always restart)."""
+        if item is None:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if idx is None or not isinstance(idx, int):
+            return
+        self._select_phrase_idx(idx, source="visual")
+        try:
+            self.player.play()
+        except Exception:
+            pass
+
+    def _on_visual_timeline_playhead_moved(self, t_s: float) -> None:
+        """Seek the player when the user moves the playhead in the Visual timeline.
+
+        This makes 'Insert word' predictable: it will be inserted at (or just after) this cursor.
+        """
+        try:
+            self._visual_cursor_time_s = float(t_s)
+        except Exception:
+            self._visual_cursor_time_s = None
+
+        # Keep audio and timeline in sync
+        try:
+            if self.player is not None:
+                self.player.setPosition(int(float(t_s) * 1000.0))
+        except Exception:
+            pass
+
+    def _on_visual_phrase_selected(self, current: QListWidgetItem, previous: QListWidgetItem):
+        """Visual tab phrase selection handler (syncs with Numeric tab)."""
+        if getattr(self, "_syncing_phrase_selection", False):
+            return
+        if current is None:
+            return
+        idx = current.data(Qt.ItemDataRole.UserRole)
+        if idx is None or not isinstance(idx, int):
+            return
+        self._select_phrase_idx(idx, source="visual")
+
+    def _select_phrase_idx(self, idx: int, source: str = "kara"):
+        """Shared phrase selection logic for Numeric and Visual editors."""
         if idx < 0 or idx >= len(self._phrases):
             return
 
+        self._current_phrase_idx = int(idx)
         phrase = self._phrases[idx]
-        start = self._get_phrase_field(phrase, "start") or 0.0
-        end = self._get_phrase_field(phrase, "end") or 0.0
+
+        start = float(self._get_phrase_field(phrase, "start") or 0.0)
 
         # Determine line_index for words
         line_index = self._get_phrase_field(phrase, "line_index")
         if line_index is None:
             line_index = idx
+
+        # Sync both phrase lists (avoid recursion)
+        self._syncing_phrase_selection = True
+        try:
+            if source != "kara" and hasattr(self, "kara_scroll_list") and self.kara_scroll_list is not None:
+                if self.kara_scroll_list.currentRow() != idx:
+                    self.kara_scroll_list.setCurrentRow(idx)
+            if source != "visual" and hasattr(self, "visual_phrase_list") and self.visual_phrase_list is not None:
+                if self.visual_phrase_list.currentRow() != idx:
+                    self.visual_phrase_list.setCurrentRow(idx)
+        finally:
+            self._syncing_phrase_selection = False
 
         # Sync the 'Selected phrase timing' panel UI (no audio seek here)
         self._sync_phrase_timing_panel(idx, phrase)
@@ -2049,9 +3782,6 @@ class VocalTab(QWidget):
         # Seek audio to the beginning of this phrase
         position_ms = int(start * 1000.0)
         if hasattr(self, "kara_slider"):
-            if getattr(self, "_media_duration_ms", 0) > 0 and self.kara_slider.maximum() == 0:
-                self.kara_slider.setRange(0, self._media_duration_ms)
-
             self.kara_slider.blockSignals(True)
             self.kara_slider.setValue(position_ms)
             self.kara_slider.blockSignals(False)
@@ -2064,8 +3794,12 @@ class VocalTab(QWidget):
         # Update karaoke labels/highlight immediately
         self._update_karaoke_for_time(start)
 
-        # Update the words column for this phrase
+        # Update the words column for this phrase (numeric tab)
         self._refresh_karaoke_words(line_index)
+
+        # Update the visual editor (if available)
+        self._refresh_visual_editor_for_phrase(idx)
+
 
 
     def _on_phrase_start_slider_moved(self, position_ms: int) -> None:
@@ -2187,6 +3921,25 @@ class VocalTab(QWidget):
         current.setText(f"{idx + 1:03d} {times}  {text}")
         self.lbl_align_status.setText(f"Updated timing of phrase {idx + 1}.")
 
+    def _reindex_words_for_line(self, line_index: int) -> None:
+        """
+        Ensure every word of the given line_index has a consistent 'word_index'
+        based on time order. This makes repeated-word highlighting deterministic.
+        """
+        items = []
+        for gidx, w in enumerate(self._words or []):
+            if self._get_word_field(w, "line_index") != line_index:
+                continue
+            ws = float(self._get_word_field(w, "start") or 0.0)
+            we = float(self._get_word_field(w, "end") or ws)
+            items.append((ws, we, gidx, w))
+
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+
+        for new_idx, (_, __, ___, w) in enumerate(items):
+            self._set_word_field(w, "word_index", int(new_idx))
+
+
     # ------------------------------------------------------------------
     # Save timings → JSON + SRT
     # ------------------------------------------------------------------
@@ -2287,6 +4040,9 @@ class VocalTab(QWidget):
             return
 
         # Status message only (no popup)
+        # Update "last saved" snapshot (used by Reset)
+        self._saved_phrases_snapshot = copy.deepcopy(self._phrases)
+        self._saved_words_snapshot = copy.deepcopy(self._words)
         self.lbl_align_status.setText(
             f"Timings saved to phrases.json, words.json and SRT."
         )

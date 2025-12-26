@@ -44,8 +44,8 @@ class SimpleKaraokeVisualization(BaseLyricsVisualization):
         "the active word with an audio-reactive glow. Background can be "
         "the project cover, a gradient, or a solid color."
     )
-    plugin_author: str = "Olaf"
-    plugin_version: str = "1.1.0"
+    plugin_author: str = "DrDLP"
+    plugin_version: str = "1.1.1"
 
     def __init__(
         self,
@@ -69,11 +69,14 @@ class SimpleKaraokeVisualization(BaseLyricsVisualization):
         self.config.setdefault("highlight_padding_y", 0.3)
         self.config.setdefault("highlight_color", "#ffff00")
 
-        # Center position of the phrase in normalized coordinates (0–1)
-        #  - center_x: 0 = fully left, 1 = fully right
-        #  - center_y: 0 = top, 1 = bottom
-        self.config.setdefault("center_x", 0.5)
-        self.config.setdefault("center_y", 0.6)
+        # Text anchor position in normalized coordinates (0–1)
+        # These are shared parameters exposed by the host for ALL lyrics plugins.
+        # Defaults can still be plugin-specific, hence the per-plugin setdefault here.
+        self.config.setdefault("text_pos_x", 0.5)
+        self.config.setdefault("text_pos_y", 0.6)
+
+        # Backward compatibility: if older projects stored center_x/center_y,
+        # keep them as a fallback at render time (but do not expose them as parameters).
 
         # Prefer the project cover as a background by default.
         self.config.setdefault("background_mode", "cover")
@@ -86,52 +89,21 @@ class SimpleKaraokeVisualization(BaseLyricsVisualization):
         )
 
     # ------------------------------------------------------------------
-    # Plugin parameters exposed to the host
-    # ------------------------------------------------------------------
     @classmethod
     def parameters(cls) -> Dict[str, PluginParameter]:
         """
         Declare all configurable parameters for this plugin.
 
-        Font / outline / shadow / box / background settings are delegated
-        to the shared text-style helper so that all installed fonts and
-        the background options (cover / gradient / solid) are consistent
-        across plugins.
+        Note:
+          - Shared text-style settings (font, outline, shadow, background box,
+            background mode/colors, etc.) come from lyrics_text_style.
+          - Text position (text_pos_x/text_pos_y) is provided by the host via
+            BaseLyricsVisualization and is therefore NOT duplicated here.
         """
-        # Shared text-style parameters (font family, size, bold, color,
-        # outline, shadow, background box, background_mode, etc.)
         params = dict(shared_text_style_parameters())
 
-        # Plugin-specific parameters (kept on top of shared ones)
         params.update(
             {
-                # Phrase center position
-                "center_x": PluginParameter(
-                    name="center_x",
-                    label="Phrase center – horizontal",
-                    type="float",
-                    default=0.5,
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.01,
-                    description=(
-                        "Horizontal position of the phrase center inside the frame "
-                        "(0.0 = far left, 1.0 = far right)."
-                    ),
-                ),
-                "center_y": PluginParameter(
-                    name="center_y",
-                    label="Phrase center – vertical",
-                    type="float",
-                    default=0.6,
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.01,
-                    description=(
-                        "Vertical position of the phrase center inside the frame "
-                        "(0.0 = top, 1.0 = bottom)."
-                    ),
-                ),
                 # Highlight controls
                 "glow_strength": PluginParameter(
                     name="glow_strength",
@@ -148,40 +120,34 @@ class SimpleKaraokeVisualization(BaseLyricsVisualization):
                     label="Show full phrase",
                     type="bool",
                     default=True,
-                    description="If unchecked, only the highlighted word is drawn.",
+                    description="If disabled, only the highlighted word is shown.",
                 ),
                 "highlight_padding_x": PluginParameter(
                     name="highlight_padding_x",
-                    label="Highlight padding (horizontal)",
+                    label="Highlight padding X",
                     type="float",
                     default=0.4,
                     minimum=0.0,
-                    maximum=1.0,
+                    maximum=5.0,
                     step=0.05,
-                    description=(
-                        "Horizontal padding around the active word highlight box, "
-                        "in units of text height."
-                    ),
+                    description="Horizontal padding around the active word (in em units).",
                 ),
                 "highlight_padding_y": PluginParameter(
                     name="highlight_padding_y",
-                    label="Highlight padding (vertical)",
+                    label="Highlight padding Y",
                     type="float",
                     default=0.3,
                     minimum=0.0,
-                    maximum=1.0,
+                    maximum=5.0,
                     step=0.05,
-                    description=(
-                        "Vertical padding around the active word highlight box, "
-                        "in units of text height."
-                    ),
+                    description="Vertical padding around the active word (in em units).",
                 ),
                 "highlight_color": PluginParameter(
                     name="highlight_color",
                     label="Highlight color",
                     type="color",
                     default="#ffff00",
-                    description="Fill color used behind the active word.",
+                    description="Fill color behind the active word.",
                 ),
             }
         )
@@ -327,28 +293,27 @@ class SimpleKaraokeVisualization(BaseLyricsVisualization):
             fm = QFontMetrics(base_font)
 
         font_color = font_color_from_config(self.config)
-
         # ------------------------------------------------------------------
-        # Compute phrase center from sliders (normalized 0–1)
+        # Compute phrase anchor (shared text_pos_x/text_pos_y, per-plugin)
         # ------------------------------------------------------------------
-        def _clamp01(value: float, default: float) -> float:
+        def _clamp01(value: Any, default: float) -> float:
             try:
-                v = float(value)
+                v = float(value)  # type: ignore[arg-type]
             except Exception:
                 v = default
             return max(0.0, min(1.0, v))
 
-        center_x_frac = _clamp01(self.config.get("center_x", 0.5), 0.5)
-        center_y_frac = _clamp01(self.config.get("center_y", 0.6), 0.6)
+        # Prefer new keys, fallback to legacy center_x/center_y
+        x_frac = _clamp01(self.config.get("text_pos_x", self.config.get("center_x", 0.5)), 0.5)
+        y_frac = _clamp01(self.config.get("text_pos_y", self.config.get("center_y", 0.6)), 0.6)
+
+        if hasattr(self, "get_text_anchor") and callable(getattr(self, "get_text_anchor")):
+            center_x_px, baseline_y = self.get_text_anchor(rect)
+        else:
+            center_x_px = rect.left() + x_frac * rect.width()
+            baseline_y = rect.top() + y_frac * rect.height()
 
         line_width = fm.horizontalAdvance(display_line)
-
-        # Horizontal center in pixels
-        center_x_px = rect.left() + center_x_frac * rect.width()
-        # Baseline Y from top
-        baseline_y = rect.top() + center_y_frac * rect.height()
-
-        # X of the beginning of the line
         line_x0 = center_x_px - line_width / 2.0
 
         # ------------------------------------------------------------------

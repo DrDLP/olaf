@@ -77,6 +77,7 @@ class ProjectsTab(QWidget):
         self.lbl_track_time: QLabel
 
         self._projects_by_name: Dict[str, Project] = {}
+        self._projects_by_id = {}
         self._current_project: Optional[Project] = None
 
         # Palette used when there is no background cover
@@ -311,24 +312,46 @@ class ProjectsTab(QWidget):
         """Reload projects from disk and refresh the list widget."""
         projects = list_projects()
 
-        self._projects_by_name.clear()
+        # Read the last selected project id (if any) so we can restore it on startup.
+        settings = QSettings("Olaf", "OlafApp")
+        last_project_id = settings.value("projects/last_selected_project_id", "", type=str) or ""
+
+        self._projects_by_id.clear()
+        self.project_list.blockSignals(True)
         self.project_list.clear()
 
         for proj in projects:
             item = QListWidgetItem(proj.name)
+            # Store the stable project id on the item (robust even if names collide).
+            item.setData(Qt.ItemDataRole.UserRole, proj.id)
+
             # Apply bigger font + semi-transparent background
             self._style_project_list_item(item)
             self.project_list.addItem(item)
-            self._projects_by_name[proj.name] = proj
+            self._projects_by_id[proj.id] = proj
 
-        if projects:
-            self.project_list.setCurrentRow(0)
-        else:
+        self.project_list.blockSignals(False)
+
+        if not projects:
             self._current_project = None
             self.show_details(None)
             self.update_cover_preview(None)
             self._update_list_background(None)
             self.projectSelected.emit(None)
+            return
+
+        # Prefer restoring the last selected project.
+        row_to_select = 0
+        if last_project_id:
+            for row in range(self.project_list.count()):
+                it = self.project_list.item(row)
+                if it is None:
+                    continue
+                if str(it.data(Qt.ItemDataRole.UserRole) or "") == last_project_id:
+                    row_to_select = row
+                    break
+
+        self.project_list.setCurrentRow(row_to_select)
 
 
     # ------------------------------------------------------------------ #
@@ -365,8 +388,17 @@ class ProjectsTab(QWidget):
         if not items:
             return
 
-        name = items[0].text()
-        project = self._projects_by_name.get(name)
+        item = items[0]
+        project_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        project = self._projects_by_id.get(project_id)
+
+        # Backward compatibility: if the item has no id stored, fall back to name.
+        if project is None:
+            for p in self._projects_by_id.values():
+                if p.name == item.text():
+                    project = p
+                    break
+
         if not project:
             return
 
@@ -380,6 +412,13 @@ class ProjectsTab(QWidget):
             return
 
         delete_project(project)
+
+        # If we just deleted the last selected project, clear the preference.
+        settings = QSettings("Olaf", "OlafApp")
+        last_project_id = settings.value("projects/last_selected_project_id", "", type=str) or ""
+        if last_project_id and last_project_id == project.id:
+            settings.setValue("projects/last_selected_project_id", "")
+
         self.refresh_projects()
 
     def _on_project_selected_in_list(self) -> None:
@@ -393,8 +432,17 @@ class ProjectsTab(QWidget):
             self.projectSelected.emit(None)
             return
 
-        name = items[0].text()
-        project = self._projects_by_name.get(name)
+        item = items[0]
+        project_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        project = self._projects_by_id.get(project_id)
+
+        # Backward compatibility: older items might not have UserRole data.
+        if project is None:
+            for p in self._projects_by_id.values():
+                if p.name == item.text():
+                    project = p
+                    break
+
         self._current_project = project
 
         self.show_details(project)
@@ -402,6 +450,12 @@ class ProjectsTab(QWidget):
         self._update_list_background(project)
         self._reset_audio_ui()
         self.projectSelected.emit(project)
+
+        # Persist last selected project so the app can restore it on next launch.
+        if project is not None:
+            settings = QSettings("Olaf", "OlafApp")
+            settings.setValue("projects/last_selected_project_id", project.id)
+
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)

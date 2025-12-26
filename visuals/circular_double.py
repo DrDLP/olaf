@@ -308,7 +308,7 @@ class CircularOuterNoBorderVisualization(BaseVisualization):
         "Amorphous circular ring around a pulsing inner disc. "
         "Outer shape follows stem 1, inner disc follows stem 2."
     )
-    plugin_author = "Dr DLP"
+    plugin_author = "DrDLP"
     plugin_version = "1.3.0"
     plugin_max_inputs = 2
 
@@ -318,9 +318,9 @@ class CircularOuterNoBorderVisualization(BaseVisualization):
 
         defaults = {
             "num_bins": 256,
-            "inner_radius_factor": 0.55,
+            "inner_radius_factor": 0.25,
             "inner_pulse_amount": 0.35,
-            "bar_length_factor": 0.45,       # up to 2.0
+            "bar_length_factor": 1.45,       # up to 2.0
             "bar_energy_gain": 1.0,
             "rotation_speed_deg": 60.0,
             "rotation_energy_gain": 1.5,
@@ -352,7 +352,7 @@ class CircularOuterNoBorderVisualization(BaseVisualization):
                 name="inner_radius_factor",
                 label="Inner circle size",
                 type="float",
-                default=0.55,
+                default=0.25,
                 minimum=0.2,
                 maximum=0.9,
                 step=0.02,
@@ -373,7 +373,7 @@ class CircularOuterNoBorderVisualization(BaseVisualization):
                 name="bar_length_factor",
                 label="Ring thickness",
                 type="float",
-                default=0.45,
+                default=1.45,
                 minimum=0.1,
                 maximum=2.0,
                 step=0.05,

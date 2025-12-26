@@ -42,7 +42,7 @@ class CoverPixelatePulseEffect(BaseCoverEffect):
         "Audio-reactive pixelation: the image becomes a coarse mosaic on loud "
         "sections and returns to full resolution on quiet parts."
     )
-    effect_author: str = "Olaf"
+    effect_author: str = "DrDLP"
     effect_version: str = "0.1.0"
     effect_max_inputs: int = 1  # typically one stem drives the amplitude
 
