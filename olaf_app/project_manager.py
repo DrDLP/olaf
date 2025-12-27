@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 import shutil
+import subprocess
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -250,6 +251,82 @@ class Project:
         if not self.audio_file:
             return None
         return self.folder / self.audio_file
+        
+    def get_preview_mix_path(self) -> Path:
+        """Return absolute path to preview_mix.wav (may not exist yet)."""
+        return self.folder / "preview_mix.wav"
+
+    def ensure_preview_mix(self, force: bool = False) -> Optional[Path]:
+        """
+        Ensure 'preview_mix.wav' exists in the project root.
+
+        This provides a stable WAV source for preview/playback and downstream
+        processing. If the main audio is already a WAV, we copy it. Otherwise
+        we attempt a conversion via ffmpeg.
+
+        Args:
+            force: If True, rebuild even if preview_mix.wav already exists.
+
+        Returns:
+            Absolute path to preview_mix.wav, or None if the project has no audio yet.
+
+        Raises:
+            RuntimeError: if ffmpeg is missing or conversion fails.
+        """
+        src = self.get_audio_path()
+        if src is None or not src.is_file():
+            return None
+
+        out_path = self.get_preview_mix_path()
+
+        # Skip rebuild if preview is newer than (or equal to) the source.
+        if not force and out_path.is_file():
+            try:
+                if out_path.stat().st_mtime >= src.stat().st_mtime:
+                    return out_path
+            except Exception:
+                return out_path
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Fast path: WAV -> WAV copy
+        if src.suffix.lower() == ".wav":
+            try:
+                shutil.copy2(src, out_path)
+                return out_path
+            except Exception:
+                # If copy fails for any reason, fall back to ffmpeg.
+                pass
+
+        ffmpeg_exe = shutil.which("ffmpeg")
+        if not ffmpeg_exe:
+            raise RuntimeError(
+                "ffmpeg was not found in PATH. Install ffmpeg (or add it to PATH) "
+                "to generate preview_mix.wav from non-WAV audio."
+            )
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i",
+            str(src),
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(out_path),
+        ]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0 or not out_path.is_file():
+            stderr = (proc.stderr or "").strip()
+            raise RuntimeError(
+                f"ffmpeg conversion failed (code {proc.returncode}).\n{stderr}"
+            )
+
+        return out_path
 
     def get_cover_path(self) -> Optional[Path]:
         """Return absolute path to cover image, if any."""

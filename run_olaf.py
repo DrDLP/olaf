@@ -18,6 +18,18 @@ BASE_PACKAGES = [
     "phonemizer",
 ]
 
+DEMUCS_EXTRA_PACKAGES = [
+    "dora-search",
+    "diffq>=0.2.1",
+    "einops",
+    "julius>=0.2.3",
+    "lameenc>=1.2",
+    "openunmix",
+    "pyyaml",
+    "tqdm",
+]
+
+
 # Additional packages required for visualization plugins (3D / neon ribbons, etc.)
 VISUAL_PACKAGES = [
     "numpy",          # usually already pulled by other deps but kept explicit
@@ -140,6 +152,13 @@ def install_other_packages(venv_python: Path) -> None:
     except subprocess.CalledProcessError as e:
         print("[olaf] WARNING: Could not install demucs:", e)
         print("[olaf] Stem separation may not work.")
+
+    print("[olaf] Installing Demucs runtime dependencies…")
+    try:
+        run_pip(venv_python, ["install", "--upgrade", *DEMUCS_EXTRA_PACKAGES])
+    except subprocess.CalledProcessError as e:
+        print("[olaf] WARNING: Could not install Demucs dependencies:", e)
+        print("[olaf] Stem separation may fail (missing runtime deps).")
 
     # Install openai-whisper WITHOUT pulling torch
     print("[olaf] Installing openai-whisper (without dependencies)…")

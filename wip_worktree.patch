@@ -1,0 +1,881 @@
+diff --git a/olaf_app/project_manager.py b/olaf_app/project_manager.py
+index 346655c..1f6cea4 100644
+--- a/olaf_app/project_manager.py
++++ b/olaf_app/project_manager.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import json
+ import uuid
+ import shutil
++import subprocess
+ from dataclasses import dataclass, asdict, field
+ from datetime import datetime
+ from pathlib import Path
+@@ -250,6 +251,82 @@ class Project:
+         if not self.audio_file:
+             return None
+         return self.folder / self.audio_file
++        
++    def get_preview_mix_path(self) -> Path:
++        """Return absolute path to preview_mix.wav (may not exist yet)."""
++        return self.folder / "preview_mix.wav"
++
++    def ensure_preview_mix(self, force: bool = False) -> Optional[Path]:
++        """
++        Ensure 'preview_mix.wav' exists in the project root.
++
++        This provides a stable WAV source for preview/playback and downstream
++        processing. If the main audio is already a WAV, we copy it. Otherwise
++        we attempt a conversion via ffmpeg.
++
++        Args:
++            force: If True, rebuild even if preview_mix.wav already exists.
++
++        Returns:
++            Absolute path to preview_mix.wav, or None if the project has no audio yet.
++
++        Raises:
++            RuntimeError: if ffmpeg is missing or conversion fails.
++        """
++        src = self.get_audio_path()
++        if src is None or not src.is_file():
++            return None
++
++        out_path = self.get_preview_mix_path()
++
++        # Skip rebuild if preview is newer than (or equal to) the source.
++        if not force and out_path.is_file():
++            try:
++                if out_path.stat().st_mtime >= src.stat().st_mtime:
++                    return out_path
++            except Exception:
++                return out_path
++
++        out_path.parent.mkdir(parents=True, exist_ok=True)
++
++        # Fast path: WAV -> WAV copy
++        if src.suffix.lower() == ".wav":
++            try:
++                shutil.copy2(src, out_path)
++                return out_path
++            except Exception:
++                # If copy fails for any reason, fall back to ffmpeg.
++                pass
++
++        ffmpeg_exe = shutil.which("ffmpeg")
++        if not ffmpeg_exe:
++            raise RuntimeError(
++                "ffmpeg was not found in PATH. Install ffmpeg (or add it to PATH) "
++                "to generate preview_mix.wav from non-WAV audio."
++            )
++
++        cmd = [
++            ffmpeg_exe,
++            "-y",
++            "-i",
++            str(src),
++            "-acodec",
++            "pcm_s16le",
++            "-ar",
++            "44100",
++            "-ac",
++            "2",
++            str(out_path),
++        ]
++
++        proc = subprocess.run(cmd, capture_output=True, text=True)
++        if proc.returncode != 0 or not out_path.is_file():
++            stderr = (proc.stderr or "").strip()
++            raise RuntimeError(
++                f"ffmpeg conversion failed (code {proc.returncode}).\n{stderr}"
++            )
++
++        return out_path
+ 
+     def get_cover_path(self) -> Optional[Path]:
+         """Return absolute path to cover image, if any."""
+diff --git a/olaf_app/projects_tab.py b/olaf_app/projects_tab.py
+index 6421375..bb03f04 100644
+--- a/olaf_app/projects_tab.py
++++ b/olaf_app/projects_tab.py
+@@ -359,7 +359,7 @@ class ProjectsTab(QWidget):
+     # ------------------------------------------------------------------ #
+ 
+     def _on_new_project_clicked(self) -> None:
+-        """Create a new project by asking for a name (no file dialog)."""
++        """Create a new project and prompt for the main audio file."""
+         name, ok = QInputDialog.getText(
+             self,
+             "New project",
+@@ -382,6 +382,13 @@ class ProjectsTab(QWidget):
+                 self.project_list.setCurrentRow(row)
+                 break
+ 
++        # Ensure selection signal has updated _current_project
++        QApplication.processEvents()
++
++        # Prompt audio import immediately (this will also create preview_mix.wav)
++        self._on_choose_audio_clicked()
++
++
+     def _on_delete_project_clicked(self) -> None:
+         """Delete currently selected project (after confirmation)."""
+         items = self.project_list.selectedItems()
+@@ -658,11 +665,24 @@ class ProjectsTab(QWidget):
+ 
+         try:
+             self._current_project.set_audio_from_path(src_to_copy)
++             # NEW: Generate a stable WAV preview mix immediately
++            try:
++                self._current_project.ensure_preview_mix()
++            except Exception as e:
++                QMessageBox.warning(
++                    self,
++                    "Preview mix",
++                    "Audio was imported, but preview_mix.wav could not be generated.\n\n"
++                    f"{e}\n\n"
++                    "Some previews may not work until this is fixed (ffmpeg in PATH).",
++                )
++           
+         except Exception as e:
+             QMessageBox.critical(self, "Error", f"Could not copy audio:\n{e}")
+             return
+ 
+         self.show_details(self._current_project)
++        self.projectSelected.emit(self._current_project)
+ 
+     def _on_choose_cover_clicked(self) -> None:
+         if not self._current_project:
+@@ -686,6 +706,7 @@ class ProjectsTab(QWidget):
+             return
+ 
+         self.show_details(self._current_project)
++        self.projectSelected.emit(self._current_project)        
+         self.update_cover_preview(self._current_project)
+         self._update_list_background(self._current_project)
+ 
+diff --git a/olaf_app/stem_separator.py b/olaf_app/stem_separator.py
+index 516c77e..5014082 100644
+--- a/olaf_app/stem_separator.py
++++ b/olaf_app/stem_separator.py
+@@ -35,18 +35,20 @@ def separate_stems_for_project(
+     quality: str = "balanced",
+     progress_cb: ProgressCallback | None = None,
+ ) -> StemSeparationResult:
+-
+     """
+     Run Demucs stem separation for the project's audio file.
+ 
+-    - Uses `python -m demucs -n <model> -o <temp_out_root> <audio>`
+-    - Moves produced stems into project.folder / "stems" / <model>/
+-    - Updates project.stems_by_model[model] accordingly
++    Progress behavior:
++    - Demucs tqdm progress (possibly multiple bars) is mapped into 0..90%.
++    - Post-processing (moving files + saving metadata) is mapped into 90..100%.
++    - Progress is monotonic (never goes backwards) and never hits 100% too early.
+     """
++    from collections import deque
++    import os
++
+     audio_path = project.get_audio_path()
+     if not audio_path or not audio_path.is_file():
+         raise FileNotFoundError("Audio file not found for this project.")
+-
+     audio_path = audio_path.resolve()
+ 
+     def report(p: float, msg: str):
+@@ -55,11 +57,9 @@ def separate_stems_for_project(
+ 
+     report(0.0, "Starting stem separation...")
+ 
+-    # Final stems folder for this model
+     stems_dir = project.folder / "stems" / model
+     stems_dir.mkdir(parents=True, exist_ok=True)
+ 
+-    # Temporary Demucs output directory
+     temp_out_root = project.folder / "stems_temp"
+     if temp_out_root.exists():
+         shutil.rmtree(temp_out_root)
+@@ -68,93 +68,169 @@ def separate_stems_for_project(
+     # Quality presets -> Demucs CLI options
+     extra_args: list[str] = []
+     q = (quality or "balanced").lower()
+-
+     if q == "fast":
+-        # Moins d'overlap, une seule passe
+         extra_args = ["--overlap", "0.1", "--shifts", "1"]
+     elif q == "hq":
+-        # Plus d'overlap, plusieurs passes -> meilleure qualité, plus lent
+         extra_args = ["--overlap", "0.5", "--shifts", "5"]
+     else:
+-        # balanced (proche du comportement par défaut)
+         extra_args = ["--overlap", "0.25", "--shifts", "1"]
+ 
+-    cmd = [
+-        sys.executable,
+-        "-m",
+-        "demucs",
+-        "-n",
+-        model,
+-        "-o",
+-        str(temp_out_root),
+-        *extra_args,
+-        str(audio_path),
+-    ]
+-
+-
+-    report(0.0, f"Running Demucs ({model})...")
+-    proc = subprocess.Popen(
+-        cmd,
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-        text=True,
+-        bufsize=1,
+-    )
+-
+-    assert proc.stdout is not None
+-    for line in proc.stdout:
+-        line = line.rstrip("\n")
+-        pct = _parse_progress(line)
+-        if pct is not None:
+-            report(pct, line)
+-        # sinon on ignore silencieusement
+-
+-    retcode = proc.wait()
++    # -----------------------
++    # Global progress mapping (Demucs -> 0..90)
++    # -----------------------
++    overall_pct = 0.0        # monotonic overall progress (0..100)
++    demucs_cap = 90.0        # never go above this while Demucs runs
++    demucs_bar_index = 0
++    demucs_last_pct: float | None = None
++
++    def _set_overall(p: float, msg: str):
++        nonlocal overall_pct
++        p = max(0.0, min(100.0, float(p)))
++        overall_pct = max(overall_pct, p)
++        report(overall_pct, msg)
++
++    def _map_demucs_progress(local_pct: float) -> float:
++        """
++        Map Demucs local percent (0..100) into overall (0..demucs_cap).
++        Demucs can restart tqdm bars; we detect big drops and treat them as a new bar.
++        """
++        nonlocal demucs_bar_index, demucs_last_pct
++
++        lp = max(0.0, min(100.0, float(local_pct)))
++
++        # Detect bar reset (e.g., 99 -> 1)
++        if demucs_last_pct is not None and lp + 5.0 < demucs_last_pct:
++            demucs_bar_index += 1
++            demucs_last_pct = lp
++        else:
++            demucs_last_pct = lp if demucs_last_pct is None else max(demucs_last_pct, lp)
++
++        # Most of the range is bar 0; later bars share the last small slice.
++        bar0_end = 85.0
++        if demucs_bar_index <= 0:
++            mapped = (lp / 100.0) * bar0_end
++        else:
++            mapped = bar0_end + (lp / 100.0) * (demucs_cap - bar0_end)
++
++        return min(mapped, demucs_cap)
++
++    def run_demucs(device: str | None) -> tuple[int, list[str], list[str]]:
++        cmd = [
++            sys.executable,
++            "-m",
++            "demucs",
++            "-n",
++            model,
++            "-o",
++            str(temp_out_root),
++            *extra_args,
++        ]
++        if device:
++            cmd += ["-d", device]
++        cmd.append(str(audio_path))
++
++        _set_overall(overall_pct, f"Running Demucs ({model})" + (f" on {device.upper()}..." if device else "..."))
++
++        env = os.environ.copy()
++        env["PYTHONUNBUFFERED"] = "1"
++
++        full: list[str] = []
++        tail = deque(maxlen=200)
++
++        proc = subprocess.Popen(
++            cmd,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.STDOUT,
++            text=True,
++            bufsize=1,
++            env=env,
++        )
++
++        assert proc.stdout is not None
++        for line in proc.stdout:
++            line = line.rstrip("\n")
++            full.append(line)
++            tail.append(line)
++
++            pct = _parse_progress(line)
++            if pct is not None:
++                _set_overall(_map_demucs_progress(pct), line)
++            else:
++                # Forward only useful status lines, without messing with progress.
++                if any(k in line.lower() for k in ("error", "ffmpeg", "cuda", "traceback", "exception", "no module", "saving", "export")):
++                    _set_overall(overall_pct, line)
++
++        retcode = proc.wait()
++        return retcode, full, list(tail)
++
++    # First try
++    retcode, full_lines, tail_lines = run_demucs(device=None)
++
++    # Retry on CPU if CUDA-like error
+     if retcode != 0:
+-        raise RuntimeError(f"Demucs failed with exit code {retcode}.")
++        joined = "\n".join(tail_lines).lower()
++        cuda_like = any(
++            s in joined
++            for s in (
++                "cuda out of memory",
++                "cuda error",
++                "cudnn",
++                "device-side assert",
++                "illegal memory access",
++            )
++        )
++        if cuda_like:
++            _set_overall(overall_pct, "Demucs failed on GPU, retrying on CPU...")
++
++            if temp_out_root.exists():
++                shutil.rmtree(temp_out_root)
++            temp_out_root.mkdir(parents=True, exist_ok=True)
++
++            # IMPORTANT: reset the Demucs bar detection (NO 'nonlocal' here!)
++            demucs_bar_index = 0
++            demucs_last_pct = None
++
++            retcode, full_lines, tail_lines = run_demucs(device="cpu")
+ 
+-    report(100.0, "Demucs finished, collecting stems...")
++    if retcode != 0:
++        tail = "\n".join(tail_lines).strip()
++        raise RuntimeError(
++            f"Demucs failed with exit code {retcode}.\n\nLast output lines:\n{tail}"
++        )
+ 
+-    # Demucs output: <temp_out_root>/<model>/<track_name>/*.wav
+-    model_dir = temp_out_root / model
+-    if model_dir.exists():
+-        track_dirs = [p for p in model_dir.iterdir() if p.is_dir()]
+-    else:
+-        track_dirs = []
++    # -----------------------
++    # Post-processing (90..100)
++    # -----------------------
++    _set_overall(max(overall_pct, demucs_cap), "Demucs finished, collecting stems...")
+ 
+-    if track_dirs:
+-        track_dir = track_dirs[0]
+-    else:
+-        track_dir = temp_out_root
++    model_dir = temp_out_root / model
++    track_dirs = [p for p in model_dir.iterdir() if p.is_dir()] if model_dir.exists() else []
++    track_dir = track_dirs[0] if track_dirs else temp_out_root
+ 
+     exts = {".wav", ".flac", ".mp3", ".ogg", ".m4a"}
+-    stem_paths: dict[str, Path] = {}
++    files_to_move = [p for p in track_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+ 
+-    for stem_file in track_dir.iterdir():
+-        if not stem_file.is_file():
+-            continue
+-        if stem_file.suffix.lower() not in exts:
+-            continue
++    stem_paths: dict[str, Path] = {}
++    move_start = max(overall_pct, 90.0)
++    move_end = 99.0
++    span = max(0.0, move_end - move_start)
++    total = max(1, len(files_to_move))
+ 
++    for i, stem_file in enumerate(files_to_move, start=1):
+         name = stem_file.stem.lower()
+         dst = stems_dir / stem_file.name
+-        # overwrite if it exists for this model
+         if dst.exists():
+             dst.unlink()
+         shutil.move(stem_file, dst)
+         stem_paths[name] = dst
+ 
+-    # Clean up temp directory
++        _set_overall(move_start + (i / total) * span, f"Collecting stems: {stem_file.name}")
++
+     if temp_out_root.exists():
+         shutil.rmtree(temp_out_root)
+ 
+-    # Update project metadata: stems_by_model[model] = {stem_name: rel_path}
+-    rel_mapping = {
+-        stem_name: str(path.relative_to(project.folder))
+-        for stem_name, path in stem_paths.items()
+-    }
++    rel_mapping = {stem_name: str(path.relative_to(project.folder)) for stem_name, path in stem_paths.items()}
+     project.set_stems_for_model(model, rel_mapping)
+ 
+-    report(100.0, "Stems collected.")
+-
++    _set_overall(100.0, "Stems collected.")
+     return StemSeparationResult(stems=stem_paths)
+diff --git a/olaf_app/stems_tab.py b/olaf_app/stems_tab.py
+index 0204aa3..254350d 100644
+--- a/olaf_app/stems_tab.py
++++ b/olaf_app/stems_tab.py
+@@ -5,6 +5,7 @@ from typing import Optional
+ 
+ import numpy as np
+ import soundfile as sf
++import re
+ 
+ from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+ from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QDesktopServices
+@@ -246,6 +247,62 @@ class StemsTab(QWidget):
+     # ------------------------------------------------------------------
+     # UI helpers
+     # ------------------------------------------------------------------
++    def _format_progress_message(self, percent: float, message: str) -> str:
++        """Format noisy CLI progress output into a stable one-line UI label."""
++        p = float(percent or 0.0)
++        if p < 0.0:
++            p = 0.0
++        if p > 100.0:
++            p = 100.0
++
++        raw = (message or "").strip()
++        if not raw:
++            return f"{p:5.1f}%"
++
++        # Avoid mangling stack traces and critical error lines.
++        lower = raw.lower()
++        if "traceback" in lower or "error" in lower or "exception" in lower:
++            return raw[:220]
++
++        hashes = ""
++
++        # Move leading '####' blocks to the end to prevent the start of the line from shifting.
++        m = re.match(r"^\s*(#+)\s*(.*)$", raw)
++        if m:
++            hashes = m.group(1)
++            raw = (m.group(2) or "").strip()
++
++        # Convert tqdm-like lines: " 23%|####      |  1/4 ..." -> keep info, move bar hashes to end.
++        m = re.match(r"^\s*(\d+(?:\.\d+)?)%\|([^|]+)\|\s*(.*)$", raw)
++        if m:
++            bar = (m.group(2) or "").strip()
++            tail = (m.group(3) or "").strip()
++            bar_hashes = "".join(ch for ch in bar if ch == "#")
++            if bar_hashes:
++                hashes = (hashes + bar_hashes)
++            raw = tail or raw
++
++        # Drop any percent prefix already present in the message.
++        raw = re.sub(r"^\s*\d+(?:\.\d+)?%\s*", "", raw).strip()
++
++        # Round overly-precise floats in the remaining message (e.g. speeds like 1.234567it/s).
++        def _round_float(mf: re.Match) -> str:
++            try:
++                return f"{float(mf.group(0)):.2f}"
++            except Exception:
++                return mf.group(0)
++
++        raw = re.sub(r"\b\d+\.\d{4,}\b", _round_float, raw)
++
++        pct_str = f"{p:5.1f}%"
++
++        if hashes:
++            hashes = hashes[:30]
++            if raw:
++                return f"{pct_str} {raw} {hashes}"[:220]
++            return f"{pct_str} {hashes}"[:220]
++
++        return f"{pct_str} {raw}"[:220]
+ 
+     def _add_model_choice(self, base_label: str, model_key: str):
+         """
+@@ -769,9 +826,10 @@ class StemsTab(QWidget):
+ 
+         def progress_cb(percent: float, message: str):
+             self.stems_progress.setValue(int(percent))
+-            self.lbl_stems_status.setText(message[:150])
++            self.lbl_stems_status.setText(self._format_progress_message(percent, message))
+             QApplication.processEvents()
+ 
++
+         try:
+             separate_stems_for_project(
+                 self._project,
+diff --git a/readme.md b/readme.md
+index 9d3c6c0..e563883 100644
+--- a/readme.md
++++ b/readme.md
+@@ -1,136 +1,150 @@
+-<<<<<<< HEAD
+-
+-=======
+-<table>
+-  <tr>
+-    <td style="vertical-align: middle; padding-right: 12px;">
+-      <img src="OLAF.png" alt="OLAF logo" width="60" />
+-    </td>
+-    <td style="vertical-align: middle;">
+-      <h1 style="margin: 0;">Olaf</h1>
+-    </td>
+-  </tr>
+-</table>
+-
+-
+-
+-
+-Olaf is a Windows-first desktop application that helps automate a **video-ready visuals pipeline** for AI-generated songs (e.g. Suno).
+-
+-The goal is simple: start from a song (audio + optional cover + lyrics), then build and export a visual composition using:
+-- **stem separation** (to route visuals to drums/bass/vocals)
+-- **vocal/lyrics alignment** (word-level timings)
+-- **3D audio-reactive visual plugins**
+-- **2D cover effects chain** (audio-reactive post-processing / stylization)
+-- **lyrics visuals** (karaoke / scroll / overlays)
+-- **final export** to a rendered video
+-
+-> Olaf is a personal/experimental tool. Expect rough edges and hardware-dependent performance.
+-
+----
+-
+-## Demos
+-
+-- **Audio-Reactive 3D Visuals (Mecha-Choir Constellations)**  
+-  https://www.youtube.com/watch?v=bvN-NeYG6i4
+-- **Audio-Reactive 2D Cover**  
+-  https://www.youtube.com/watch?v=wsodUrkk3sQ
+-- **Audio-Reactive 3D Visuals (SDF Pulsing Glyph Rings)**  
+-  https://www.youtube.com/watch?v=IMLHwsDYGwA
+-
+----
+-
+-## Platform support
+-
+-- **Primary target:** Windows
+-- Other operating systems are **not thoroughly tested**.
+-
+----
+-
+-## Installation (Windows, automatic)
+-
+-Olaf ships with a bootstrap launcher that:
+-- creates a local virtual environment (`.venv`)
+-- installs dependencies
+-- tries to install **torch + torchaudio** with CUDA wheels first (then falls back to CPU)
+-- installs optional packages used by some visuals
+-- installs **Demucs** (stems) and **openai-whisper** (alignment)
+-- launches the GUI
+-
+-This behavior is implemented in `run_olaf.py`.
+-
+-### Recommended way
+-
+-- Run `olaf.bat` (it activates `.venv` and starts Olaf)
+-
+-### Alternative
+-
+-- Run:
+-  - `python run_olaf.py`
+-
+-On first run, installation can take a while (downloads + wheels + models).
+-
+----
+-
+-## Disk space (important)
+-
+-Plan for a **large installation (often > 12 GB)** due to ML/audio models and heavy dependencies.
+-
+----
+-
+-## Performance expectations (important)
+-
+-Rendering/export can be **very slow**, especially for **2D cover effect chains** (depending on resolution, FPS, effects, and hardware).
+-
+-**Strong recommendation:** export a short segment first (10–20 seconds) before committing to a full render.
+-
+----
+-
+-## What the app does (workflow)
+-
+-A typical workflow inside Olaf looks like:
+-
+-1. **Projects**
+-   - create/select a project
+-   - import the main audio track (+ optional cover image)
+-
+-2. **Stems (optional but recommended)**
+-   - generate stems (e.g. drums/bass/vocals)
+-   - use stems for better routing (cleaner beat/pulse triggers, etc.)
+-
+-3. **Vocal alignment**
+-   - align lyrics to audio (word-level timings)
+-   - review and manually adjust phrase/word timing when needed
+-
+-4. **Visuals**
+-   - **3D visualizations:** configure audio-reactive 3D plugins and routing
+-   - **2D cover visualizations:** build an ordered chain of cover effects and routing
+-   - **Lyrics visuals:** choose a lyrics visualization plugin + style
+-
+-5. **Export**
+-   - render the final video composition
+-
+----
+-
+-## Notes & tips
+-
+-- If you only need beat/pulse, routing to the **drums** stem often produces the most stable trigger.
+-- If export is too slow, temporarily reduce:
+-  - export resolution
+-  - export FPS
+-  - number of 2D effects (2D is frequently the slowest part)
+-
+----
+-
+-## Troubleshooting (high level)
+-
+-- If an effect/plugin does not render, verify that its optional dependencies installed successfully.
+-- If stems/alignment features are missing, check installation logs: Demucs / Whisper are installed explicitly (without pulling torch again).
+-
+----
+-
+-
+-## Disclaimer
+-
+-This project is provided as-is, without warranty. Use at your own risk.
+->>>>>>> cac5d04 (Update README and docs)
++<table>
++  <tr>
++    <td style="vertical-align: middle; padding-right: 12px;">
++      <img src="OLAF.png" alt="OLAF logo" width="50" />
++    </td>
++    <td style="vertical-align: middle;">
++      <h1 style="margin: 0;">Olaf</h1>
++    </td>
++  </tr>
++</table>
++
++Olaf is a Windows-first desktop application that helps automate a **video-ready visuals pipeline** for AI-generated songs (e.g. Suno).
++
++The goal is simple: start from a song (audio + optional cover + lyrics), then build and export a visual composition using:
++- **stem separation** (to route visuals to drums/bass/vocals)
++- **vocal/lyrics alignment** (word-level timings)
++- **3D audio-reactive visual plugins**
++- **2D cover effects chain** (audio-reactive post-processing / stylization)
++- **lyrics visuals** (karaoke / scroll / overlays)
++- **final export** to a rendered video
++
++> Olaf is a personal/experimental tool. Expect rough edges and hardware-dependent performance.
++
++---
++
++## Demos
++
++- **Audio-Reactive 3D Visuals (Mecha-Choir Constellations)**  
++  https://www.youtube.com/watch?v=bvN-NeYG6i4
++- **Audio-Reactive 2D Cover**  
++  https://www.youtube.com/watch?v=wsodUrkk3sQ
++- **Audio-Reactive 3D Visuals (SDF Pulsing Glyph Rings)**  
++  https://www.youtube.com/watch?v=IMLHwsDYGwA
++
++---
++
++## Platform support
++
++- **Primary target:** Windows
++- Other operating systems are **not thoroughly tested**.
++
++---
++
++## Installation (Windows, automatic)
++
++Olaf ships with a bootstrap launcher that:
++- creates a local virtual environment (`.venv`)
++- installs dependencies
++- tries to install **torch + torchaudio** with CUDA wheels first (then falls back to CPU)
++- installs optional packages used by some visuals
++- installs **Demucs** (stems) and **openai-whisper** (alignment)
++- launches the GUI
++
++This behavior is implemented in `run_olaf.py`.
++
++### Recommended way
++
++- Run `olaf.bat` (it activates `.venv` and starts Olaf)
++
++### Alternative
++
++- Run:
++  - `python run_olaf.py`
++
++On first run, installation can take a while (downloads + wheels + models).
++
++---
++
++## Disk space (important)
++
++Plan for a **large installation (often > 12 GB)** due to ML/audio models and heavy dependencies.
++
++---
++
++## Performance expectations (important)
++
++Rendering/export can be **very slow**, especially for **2D cover effect chains** (depending on resolution, FPS, effects, and hardware).
++
++**Strong recommendation:** export a short segment first (10–20 seconds) before committing to a full render.
++
++---
++
++## What the app does (workflow)
++
++A typical workflow inside Olaf looks like:
++
++1. **Projects**
++   - create/select a project
++   - import the main audio track (+ optional cover image)
++
++2. **Stems (optional but recommended)**
++   - generate stems (e.g. drums/bass/vocals)
++   - use stems for better routing (cleaner beat/pulse triggers, etc.)
++
++3. **Vocal alignment**
++   - align lyrics to audio (word-level timings)
++   - review and manually adjust phrase/word timing when needed
++
++4. **Visuals**
++   - **3D visualizations:** configure audio-reactive 3D plugins and routing
++   - **2D cover visualizations:** build an ordered chain of cover effects and routing
++   - **Lyrics visuals:** choose a lyrics visualization plugin + style
++
++5. **Export**
++   - render the final video composition
++
++---
++
++## Notes & tips
++
++- If you only need beat/pulse, routing to the **drums** stem often produces the most stable trigger.
++- If export is too slow, temporarily reduce:
++  - export resolution
++  - export FPS
++  - number of 2D effects (2D is frequently the slowest part)
++
++---
++
++## Standalones
++
++**Path:** `standalones/Log 1 (3d visualizers)/`  
++
++This log contains Python scripts that generate 3D visualizations driven by audio input (e.g. waveforms, FFT, beat detection).  
++The goal is to explore spatial, abstract scenes that respond in real‑time or in offline rendering to music or sound design.
++
++### You can watch a demo of Log 1 here:  👉 https://youtu.be/5c6w_tLqjCs
++
++**Path:** `standalones/Log 3 (puppies)/`  
++
++This log contains all the scripts and assets needed to create audio‑reactive animations based on **cute chibi dog sprites**:
++
++- Sprite sheets / animation frames
++- Timing / sequencing logic
++- Audio analysis driving the animation (intensity, beat, etc.)
++- Simple pipelines to render sequences or real‑time previews
++
++### You can watch a demo of Log 3 here:  👉 https://youtu.be/adwtR8TwF6s
++
++---
++
++## Troubleshooting 
++
++- If an effect/plugin does not render, verify that its optional dependencies installed successfully.
++- If stems/alignment features are missing, check installation logs: Demucs / Whisper are installed explicitly (without pulling torch again).
++
++---
++
++## Disclaimer
++
++This project is provided as-is, without warranty. Use at your own risk.
+diff --git a/run_olaf.py b/run_olaf.py
+index ef2c949..b8dcdc0 100644
+--- a/run_olaf.py
++++ b/run_olaf.py
+@@ -18,6 +18,18 @@ BASE_PACKAGES = [
+     "phonemizer",
+ ]
+ 
++DEMUCS_EXTRA_PACKAGES = [
++    "dora-search",
++    "diffq>=0.2.1",
++    "einops",
++    "julius>=0.2.3",
++    "lameenc>=1.2",
++    "openunmix",
++    "pyyaml",
++    "tqdm",
++]
++
++
+ # Additional packages required for visualization plugins (3D / neon ribbons, etc.)
+ VISUAL_PACKAGES = [
+     "numpy",          # usually already pulled by other deps but kept explicit
+@@ -44,6 +56,13 @@ WHISPER_PACKAGE = "openai-whisper"
+ # so we pin to <3.2 to stay in the compatible range.
+ TRITON_WINDOWS_PACKAGE = 'triton-windows<3.2'
+ 
++# Add near other package constants
++WHISPER_EXTRA_PACKAGES = [
++    "tiktoken",
++    "tqdm",
++    "more-itertools",
++]
++
+ def ensure_venv() -> Path:
+     """Create .venv if needed and return the venv python executable."""
+     if not VENV_DIR.exists():
+@@ -134,6 +153,13 @@ def install_other_packages(venv_python: Path) -> None:
+         print("[olaf] WARNING: Could not install demucs:", e)
+         print("[olaf] Stem separation may not work.")
+ 
++    print("[olaf] Installing Demucs runtime dependencies…")
++    try:
++        run_pip(venv_python, ["install", "--upgrade", *DEMUCS_EXTRA_PACKAGES])
++    except subprocess.CalledProcessError as e:
++        print("[olaf] WARNING: Could not install Demucs dependencies:", e)
++        print("[olaf] Stem separation may fail (missing runtime deps).")
++
+     # Install openai-whisper WITHOUT pulling torch
+     print("[olaf] Installing openai-whisper (without dependencies)…")
+     try:
+@@ -145,6 +171,22 @@ def install_other_packages(venv_python: Path) -> None:
+         print("[olaf] WARNING: Could not install openai-whisper:", e)
+         print("[olaf] Vocal alignment features may not work.")
+ 
++    # Install openai-whisper WITHOUT pulling torch
++    print("[olaf] Installing openai-whisper (without dependencies)…")
++    try:
++        run_pip(venv_python, ["install", "--upgrade", "--no-deps", WHISPER_PACKAGE])
++    except subprocess.CalledProcessError as e:
++        print("[olaf] WARNING: Could not install openai-whisper:", e)
++        print("[olaf] Vocal alignment features may not work.")
++
++    # NEW: install Whisper runtime deps explicitly (because we used --no-deps)
++    print("[olaf] Installing Whisper runtime dependencies…")
++    try:
++        run_pip(venv_python, ["install", "--upgrade", *WHISPER_EXTRA_PACKAGES])
++    except subprocess.CalledProcessError as e:
++        print("[olaf] WARNING: Could not install Whisper dependencies:", e)
++        print("[olaf] Whisper may fail to import (e.g., missing tiktoken).")
++
+     # Optional: install Triton for faster Whisper timing kernels.
+     # - On Windows: use the 'triton-windows' fork that ships wheels.
+     # - On Linux: try the official 'triton' package.

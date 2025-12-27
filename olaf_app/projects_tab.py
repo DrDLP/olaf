@@ -359,7 +359,7 @@ class ProjectsTab(QWidget):
     # ------------------------------------------------------------------ #
 
     def _on_new_project_clicked(self) -> None:
-        """Create a new project by asking for a name (no file dialog)."""
+        """Create a new project and prompt for the main audio file."""
         name, ok = QInputDialog.getText(
             self,
             "New project",
@@ -381,6 +381,13 @@ class ProjectsTab(QWidget):
             if self.project_list.item(row).text() == project.name:
                 self.project_list.setCurrentRow(row)
                 break
+
+        # Ensure selection signal has updated _current_project
+        QApplication.processEvents()
+
+        # Prompt audio import immediately (this will also create preview_mix.wav)
+        self._on_choose_audio_clicked()
+
 
     def _on_delete_project_clicked(self) -> None:
         """Delete currently selected project (after confirmation)."""
@@ -658,11 +665,24 @@ class ProjectsTab(QWidget):
 
         try:
             self._current_project.set_audio_from_path(src_to_copy)
+             # NEW: Generate a stable WAV preview mix immediately
+            try:
+                self._current_project.ensure_preview_mix()
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Preview mix",
+                    "Audio was imported, but preview_mix.wav could not be generated.\n\n"
+                    f"{e}\n\n"
+                    "Some previews may not work until this is fixed (ffmpeg in PATH).",
+                )
+           
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not copy audio:\n{e}")
             return
 
         self.show_details(self._current_project)
+        self.projectSelected.emit(self._current_project)
 
     def _on_choose_cover_clicked(self) -> None:
         if not self._current_project:
@@ -686,6 +706,7 @@ class ProjectsTab(QWidget):
             return
 
         self.show_details(self._current_project)
+        self.projectSelected.emit(self._current_project)        
         self.update_cover_preview(self._current_project)
         self._update_list_background(self._current_project)
 

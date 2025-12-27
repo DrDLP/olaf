@@ -1,0 +1,121 @@
+diff --git a/README.md b/README.md
+deleted file mode 100644
+index a9d3f5d..0000000
+--- a/README.md
++++ /dev/null
+@@ -1,115 +0,0 @@
+-# Olaf
+-
+-Olaf is a Windows-first desktop application that helps automate a **video-ready visuals pipeline** for AI-generated songs (e.g. Suno).
+-
+-The goal is simple: start from a song (audio + optional cover + lyrics), then build and export a visual composition using:
+-- **stem separation** (to route visuals to drums/bass/vocals)
+-- **vocal/lyrics alignment** (word-level timings)
+-- **3D audio-reactive visual plugins**
+-- **2D cover effects chain** (audio-reactive post-processing / stylization)
+-- **lyrics visuals** (karaoke / scroll / overlays)
+-- **final export** to a rendered video
+-
+-> Olaf is a personal/experimental tool. Expect rough edges and hardware-dependent performance.
+-
+----
+-
+-## Platform support
+-
+-- **Primary target:** Windows
+-- Other operating systems are **not thoroughly tested**.
+-
+----
+-
+-## Installation (Windows, automatic)
+-
+-Olaf ships with a bootstrap launcher that:
+-- creates a local virtual environment (`.venv`)
+-- installs dependencies
+-- tries to install **torch + torchaudio** with CUDA wheels first (then falls back to CPU)
+-- installs optional packages used by some visuals
+-- installs **Demucs** (stems) and **openai-whisper** (alignment)
+-- launches the GUI
+-
+-This behavior is implemented in `run_olaf.py`. 
+-
+-### Recommended way
+-
+-- Run `olaf.bat` (it activates `.venv` and starts Olaf). 
+-
+-### Alternative
+-
+-- Run:
+-  - `python run_olaf.py`
+-
+-On first run, installation can take a while (downloads + wheels + models). 
+-
+----
+-
+-## Disk space (important)
+-
+-Plan for a **large installation (often > 12 GB)** due to ML/audio models and heavy dependencies.
+-
+----
+-
+-## Performance expectations (important)
+-
+-Rendering/export can be **very slow**, especially for **2D cover effect chains** (depending on resolution, FPS, effects, and hardware).
+-
+-**Strong recommendation:** export a short segment first (10–20 seconds) before committing to a full render.
+-
+----
+-
+-## What the app does (workflow)
+-
+-A typical workflow inside Olaf looks like:
+-
+-1. **Projects**
+-   - create/select a project
+-   - import the main audio track (+ optional cover image)
+-
+-2. **Stems (optional but recommended)**
+-   - generate stems (e.g. drums/bass/vocals)
+-   - use stems for better routing (cleaner beat/pulse triggers, etc.)
+-
+-3. **Vocal alignment**
+-   - align lyrics to audio (word-level timings)
+-   - review and manually adjust phrase/word timing when needed
+-
+-4. **Visuals**
+-   - **3D visualizations:** configure audio-reactive 3D plugins and routing
+-   - **2D cover visualizations:** build an ordered chain of cover effects and routing
+-   - **Lyrics visuals:** choose a lyrics visualization plugin + style
+-
+-5. **Export**
+-   - render the final video composition
+-
+----
+-
+-## Notes & tips
+-
+-- If you only need beat/pulse, routing to the **drums** stem often produces the most stable trigger.
+-- If export is too slow, temporarily reduce:
+-  - export resolution
+-  - export FPS
+-  - number of 2D effects (2D is frequently the slowest part)
+-
+----
+-
+-## Troubleshooting (high level)
+-
+-- If an effect/plugin does not render, verify that its optional dependencies installed successfully.
+-- If stems/alignment features are missing, check installation logs: Demucs / Whisper are installed explicitly (without pulling torch again). 
+-
+----
+-
+-## Documentation
+-
+-- In-repo documentation lives in `docs/` 
+-
+----
+-
+-## Disclaimer
+-
+-This project is provided as-is, without warranty. Use at your own risk.
+-

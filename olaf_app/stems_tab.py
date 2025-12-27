@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
+import re
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QDesktopServices
@@ -246,6 +247,62 @@ class StemsTab(QWidget):
     # ------------------------------------------------------------------
     # UI helpers
     # ------------------------------------------------------------------
+    def _format_progress_message(self, percent: float, message: str) -> str:
+        """Format noisy CLI progress output into a stable one-line UI label."""
+        p = float(percent or 0.0)
+        if p < 0.0:
+            p = 0.0
+        if p > 100.0:
+            p = 100.0
+
+        raw = (message or "").strip()
+        if not raw:
+            return f"{p:5.1f}%"
+
+        # Avoid mangling stack traces and critical error lines.
+        lower = raw.lower()
+        if "traceback" in lower or "error" in lower or "exception" in lower:
+            return raw[:220]
+
+        hashes = ""
+
+        # Move leading '####' blocks to the end to prevent the start of the line from shifting.
+        m = re.match(r"^\s*(#+)\s*(.*)$", raw)
+        if m:
+            hashes = m.group(1)
+            raw = (m.group(2) or "").strip()
+
+        # Convert tqdm-like lines: " 23%|####      |  1/4 ..." -> keep info, move bar hashes to end.
+        m = re.match(r"^\s*(\d+(?:\.\d+)?)%\|([^|]+)\|\s*(.*)$", raw)
+        if m:
+            bar = (m.group(2) or "").strip()
+            tail = (m.group(3) or "").strip()
+            bar_hashes = "".join(ch for ch in bar if ch == "#")
+            if bar_hashes:
+                hashes = (hashes + bar_hashes)
+            raw = tail or raw
+
+        # Drop any percent prefix already present in the message.
+        raw = re.sub(r"^\s*\d+(?:\.\d+)?%\s*", "", raw).strip()
+
+        # Round overly-precise floats in the remaining message (e.g. speeds like 1.234567it/s).
+        def _round_float(mf: re.Match) -> str:
+            try:
+                return f"{float(mf.group(0)):.2f}"
+            except Exception:
+                return mf.group(0)
+
+        raw = re.sub(r"\b\d+\.\d{4,}\b", _round_float, raw)
+
+        pct_str = f"{p:5.1f}%"
+
+        if hashes:
+            hashes = hashes[:30]
+            if raw:
+                return f"{pct_str} {raw} {hashes}"[:220]
+            return f"{pct_str} {hashes}"[:220]
+
+        return f"{pct_str} {raw}"[:220]
 
     def _add_model_choice(self, base_label: str, model_key: str):
         """
@@ -769,8 +826,9 @@ class StemsTab(QWidget):
 
         def progress_cb(percent: float, message: str):
             self.stems_progress.setValue(int(percent))
-            self.lbl_stems_status.setText(message[:150])
+            self.lbl_stems_status.setText(self._format_progress_message(percent, message))
             QApplication.processEvents()
+
 
         try:
             separate_stems_for_project(
