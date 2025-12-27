@@ -1,4 +1,16 @@
-# Olaf
+<table>
+  <tr>
+    <td style="vertical-align: middle; padding-right: 12px;">
+      <img src="OLAF.png" alt="OLAF logo" width="60" />
+    </td>
+    <td style="vertical-align: middle;">
+      <h1 style="margin: 0;">Olaf</h1>
+    </td>
+  </tr>
+</table>
+
+
+
 
 Olaf is a Windows-first desktop application that helps automate a **video-ready visuals pipeline** for AI-generated songs (e.g. Suno).
 
@@ -11,6 +23,17 @@ The goal is simple: start from a song (audio + optional cover + lyrics), then bu
 - **final export** to a rendered video
 
 > Olaf is a personal/experimental tool. Expect rough edges and hardware-dependent performance.
+
+---
+
+## Demos
+
+- **Audio-Reactive 3D Visuals (Mecha-Choir Constellations)**  
+  https://www.youtube.com/watch?v=bvN-NeYG6i4
+- **Audio-Reactive 2D Cover**  
+  https://www.youtube.com/watch?v=wsodUrkk3sQ
+- **Audio-Reactive 3D Visuals (SDF Pulsing Glyph Rings)**  
+  https://www.youtube.com/watch?v=IMLHwsDYGwA
 
 ---
 
@@ -31,18 +54,18 @@ Olaf ships with a bootstrap launcher that:
 - installs **Demucs** (stems) and **openai-whisper** (alignment)
 - launches the GUI
 
-This behavior is implemented in `run_olaf.py`. :contentReference[oaicite:0]{index=0}
+This behavior is implemented in `run_olaf.py`.
 
 ### Recommended way
 
-- Run `olaf.bat` (it activates `.venv` and starts Olaf). 
+- Run `olaf.bat` (it activates `.venv` and starts Olaf)
 
 ### Alternative
 
 - Run:
   - `python run_olaf.py`
 
-On first run, installation can take a while (downloads + wheels + models). :contentReference[oaicite:2]{index=2}
+On first run, installation can take a while (downloads + wheels + models).
 
 ---
 
@@ -98,16 +121,11 @@ A typical workflow inside Olaf looks like:
 
 ## Troubleshooting (high level)
 
-- If an effect/plugin does not render, verify that its optional dependencies installed successfully. :contentReference[oaicite:3]{index=3}
-- If stems/alignment features are missing, check installation logs: Demucs / Whisper are installed explicitly (without pulling torch again). :contentReference[oaicite:4]{index=4}
+- If an effect/plugin does not render, verify that its optional dependencies installed successfully.
+- If stems/alignment features are missing, check installation logs: Demucs / Whisper are installed explicitly (without pulling torch again).
 
 ---
 
-## Documentation
-
-- In-repo documentation lives in `docs/` 
-
----
 
 ## Disclaimer
 
