@@ -44,6 +44,13 @@ WHISPER_PACKAGE = "openai-whisper"
 # so we pin to <3.2 to stay in the compatible range.
 TRITON_WINDOWS_PACKAGE = 'triton-windows<3.2'
 
+# Add near other package constants
+WHISPER_EXTRA_PACKAGES = [
+    "tiktoken",
+    "tqdm",
+    "more-itertools",
+]
+
 def ensure_venv() -> Path:
     """Create .venv if needed and return the venv python executable."""
     if not VENV_DIR.exists():
@@ -144,6 +151,22 @@ def install_other_packages(venv_python: Path) -> None:
     except subprocess.CalledProcessError as e:
         print("[olaf] WARNING: Could not install openai-whisper:", e)
         print("[olaf] Vocal alignment features may not work.")
+
+    # Install openai-whisper WITHOUT pulling torch
+    print("[olaf] Installing openai-whisper (without dependencies)…")
+    try:
+        run_pip(venv_python, ["install", "--upgrade", "--no-deps", WHISPER_PACKAGE])
+    except subprocess.CalledProcessError as e:
+        print("[olaf] WARNING: Could not install openai-whisper:", e)
+        print("[olaf] Vocal alignment features may not work.")
+
+    # NEW: install Whisper runtime deps explicitly (because we used --no-deps)
+    print("[olaf] Installing Whisper runtime dependencies…")
+    try:
+        run_pip(venv_python, ["install", "--upgrade", *WHISPER_EXTRA_PACKAGES])
+    except subprocess.CalledProcessError as e:
+        print("[olaf] WARNING: Could not install Whisper dependencies:", e)
+        print("[olaf] Whisper may fail to import (e.g., missing tiktoken).")
 
     # Optional: install Triton for faster Whisper timing kernels.
     # - On Windows: use the 'triton-windows' fork that ships wheels.
